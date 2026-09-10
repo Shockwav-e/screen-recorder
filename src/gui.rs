@@ -133,10 +133,10 @@ impl GuiApp {
             dir: r"D:\Recordings".to_owned(),
             filename: "gameplay.webm".to_owned(),
             quality: auto_quality(),
-            // match the auto preset's bitrate (Smooth -> 8M, YouTube -> 16M)
+            // match the auto preset's bitrate (Smooth -> 8M, YouTube -> 12M)
             bitrate_sel: match auto_quality() {
                 Quality::Balanced => 0,
-                Quality::Youtube => 3,
+                Quality::Youtube => 2,
             },
             res_sel: 0, // native app size
             audio: AudioMode::System,
@@ -237,7 +237,8 @@ impl GuiApp {
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "gameplay.webm".to_owned());
-        let output = match resolve_output(&fname, &self.dir) {
+        let codec: Codec = self.quality.codec();
+        let output = match resolve_output(&fname, &self.dir, codec.container_ext()) {
             Ok(p) => p,
             Err(e) => {
                 self.error_msg = Some(format!("bad output: {e:?}"));
@@ -245,7 +246,6 @@ impl GuiApp {
             }
         };
 
-        let codec: Codec = self.quality.codec();
         let size_mode = RES_OPTIONS[self.res_sel.min(RES_OPTIONS.len() - 1)];
         let (width, height) = match resolve_size(size_mode, &source) {
             Ok(wh) => wh,
@@ -586,16 +586,16 @@ impl eframe::App for GuiApp {
                             .radio_value(&mut self.quality, Quality::Youtube, Quality::Youtube.label())
                             .clicked()
                         {
-                            self.bitrate_sel = 3;
+                            self.bitrate_sel = 2; // 12M
                         }
-                        ui.weak("Sharp 1080p60 masters; YouTube's re-encode stays clean. ~35-55% CPU on your i5.");
+                        ui.weak("H.264 MP4, hardware-encoded on Intel — smooth 60fps, YouTube's favorite format.");
                         if ui
                             .radio_value(&mut self.quality, Quality::Balanced, Quality::Balanced.label())
                             .clicked()
                         {
-                            self.bitrate_sel = 0;
+                            self.bitrate_sel = 0; // 8M
                         }
-                        ui.weak("Lowest CPU (~15-25%). Fine for drafts.");
+                        ui.weak("VP8 WebM, lowest CPU. Drafts and software-only PCs.");
                     });
                     ui.horizontal(|ui| {
                         ui.label("Bitrate:");

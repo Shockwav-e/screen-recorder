@@ -41,23 +41,21 @@ Note: per-app-only audio needs Windows 11+ — on Windows 10, mute other apps
 
 | Part | You | Verdict |
 |---|---|---|
-| CPU i5-4570 (4C/4T Haswell) | no VP9 HW encode | Balanced VP8 ≈ 15–25% CPU; YouTube VP9 ≈ 35–55% |
-| RAM 16 GB | plenty | recorder uses ~60–120 MB (2-frame queue) |
+| CPU i5-4570 (4C/4T Haswell) | Quick Sync H.264 in hardware | ~low single-digit % CPU recording |
+| RAM 16 GB | plenty | recorder uses ~60–120 MB (3-frame queue) |
 | Display 1920×1080 @100Hz | exact match | **zero scaler cost** |
 | Disk 37 GB free | fine | ~120 MB/min at 16M bitrate |
 | GPU HD 4600 | WGC capture is GPU-composited | near-zero capture overhead |
 
-## Quality for YouTube
+## Quality: hardware H.264 for YouTube, VP8/VP9 WebM when you want it
 
-YouTube re-encodes every upload, so upload a high-bitrate master:
-
-- `--quality youtube` (default): **VP9 1080p60 @ 16M**, cpu-used 5.
-  YouTube wants ~12 Mbps for 1080p60 — a 16M master keeps it sharp.
-- `--quality balanced`: **VP8 1080p60 @ 8M**, cpu-used 8 (fastest).
-  Lowest CPU, good for drafts and long sessions.
-- `--codec / --bitrate / --cpu-used` override the preset.
-- Fast-motion games need bits: 16–20M VP9 or 10–12M VP8.
-- If you see drops climbing: switch to Balanced or `--fps 30`.
+- `--quality youtube` (default on Quick Sync PCs): **H.264 MP4 @ 12M** —
+  Intel Quick Sync encodes in hardware (single-digit CPU), and H.264 MP4 is
+  YouTube's preferred upload format. Falls back to libx264 if no QSV driver.
+- `--quality smooth`: **VP8 WebM @ 8M**, pure software, lowest CPU.
+- `--codec vp8|vp9|h264`, `--bitrate`, `--cpu-used` override the preset.
+- Fast-motion games need bits: 12M H.264 or 10–12M VP8.
+- If drops climb: close background apps or `--fps 30`.
 
 ## Local games (e.g. Modern Warships)
 
@@ -93,8 +91,9 @@ Stop with **Enter** or **Ctrl+C** — the `.webm` is finalized cleanly.
 ## How it stays light
 
 - Windows Graphics Capture API (GPU-composited, event-driven — idle screen ≈ 0% CPU)
-- Fixed 1920×1080 pipe, center crop/pad in-Rust (cheap memcpy, no scaler)
-- Bounded 2-frame channel + `try_send` (never blocks capture; drops = realtime, like OBS)
+- Intel Quick Sync H.264 hardware encode (or fastest-possible software VP8/VP9)
+- Fixed-size pipe, center crop/pad in-Rust (cheap memcpy, no scaler)
+- Bounded 3-frame channel + `try_send` (never blocks capture; drops = realtime, like OBS)
 - Buffer reuse (no per-frame alloc), CFR pacer thread, realtime libvpx flags
 - FFmpeg auto-downloaded on first run (no manual install needed)
 - Zero `unsafe`, no unwraps on hot paths, all numeric inputs clamped

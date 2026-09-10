@@ -169,7 +169,7 @@ fn main() -> Result<()> {
     // Native size = the app's own size: no black bars, fastest path.
     let (width, height) = resolve_size(&args.size, &source)
         .with_context(|| "bad --size / source — try --list-windows")?;
-    let output = resolve_output(&args.output, &args.dir)?;
+    let output = resolve_output(&args.output, &args.dir, codec.container_ext())?;
     let cfg = RecordConfig {
         output,
         fps,
@@ -191,11 +191,23 @@ fn main() -> Result<()> {
     let src_desc = describe_source(&cfg)
         .with_context(|| "source unavailable — try --list-windows / --list-monitors")?;
 
+    let enc_name: &str = match codec {
+        Codec::H264 => {
+            if recorder::h264_encoder() == "h264_qsv" {
+                "H.264-QuickSync"
+            } else {
+                "H.264-x264"
+            }
+        }
+        Codec::Vp8 => "VP8",
+        Codec::Vp9 => "VP9",
+    };
     println!("shockwave  |  {src_desc}");
     println!(
-        "target    |  {width}x{height}{} @ {fps}fps  WebM({})  {} preset  bitrate {}  cpu-used {}  audio {}",
+        "target    |  {width}x{height}{} @ {fps}fps  {}({})  {} preset  bitrate {}  cpu-used {}  audio {}",
         if args.size.trim().eq_ignore_ascii_case("native") { " (native)" } else { "" },
-        codec.label(),
+        codec.container_ext(),
+        enc_name,
         match quality {
             Quality::Youtube => "youtube",
             Quality::Balanced => "smooth",
@@ -205,7 +217,7 @@ fn main() -> Result<()> {
         args.audio.label(),
     );
     if codec == Codec::Vp9 {
-        println!("note      |  VP9 on 4-thread Haswell ~= 35-55% CPU; --quality balanced for ~15-25%.");
+        println!("note      |  VP9 software encode is heavy; prefer youtube (Quick Sync) or smooth preset.");
     }
 
     let session = start_session(cfg, false)?;

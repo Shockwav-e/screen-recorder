@@ -37,14 +37,44 @@ pub enum Codec {
     Vp8,
     /// WebM VP9 — better compression at the same bitrate. Best for YouTube uploads.
     Vp9,
+    /// H.264 MP4 — Intel Quick Sync hardware encode when available
+    /// (near-zero CPU), libx264 fallback. Best all-rounder for YouTube.
+    H264,
 }
 
 impl Codec {
-    pub fn label(self) -> &'static str {
+    /// Container this codec needs (WebM can't hold H.264).
+    pub fn container_ext(self) -> &'static str {
         match self {
-            Codec::Vp8 => "VP8",
-            Codec::Vp9 => "VP9",
+            Codec::H264 => "mp4",
+            _ => "webm",
         }
+    }
+}
+
+/// True when Intel Quick Sync H.264 is usable (cached — one ~200 ms probe).
+/// NVENC is irrelevant here (no NVIDIA GPU); QSV is this machine's HW path.
+pub fn qsv_available() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let ff = ffmpeg_sidecar::paths::ffmpeg_path();
+        std::process::Command::new(ff)
+            .args(["-hide_banner", "-h", "encoder=h264_qsv"])
+            .output()
+            .map(|o| {
+                o.status.success()
+                    && String::from_utf8_lossy(&o.stdout).contains("h264_qsv")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Concrete H.264 encoder: Quick Sync hardware, else libx264 software.
+pub fn h264_encoder() -> &'static str {
+    if qsv_available() {
+        "h264_qsv"
+    } else {
+        "libx264"
     }
 }
 
@@ -63,13 +93,15 @@ pub enum Quality {
 impl Quality {
     pub fn codec(self) -> Codec {
         match self {
-            Quality::Youtube => Codec::Vp9,
+            // H.264 MP4 is YouTube's preferred upload format; Quick Sync
+            // encodes it in hardware (near-zero CPU on Intel iGPUs).
+            Quality::Youtube => Codec::H264,
             Quality::Balanced => Codec::Vp8,
         }
     }
     pub fn bitrate(self) -> &'static str {
         match self {
-            Quality::Youtube => "16M",
+            Quality::Youtube => "12M", // YT wants ~12 Mbps for 1080p60
             Quality::Balanced => "8M",
         }
     }
@@ -83,22 +115,22 @@ impl Quality {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Quality::Youtube => "YouTube HQ (VP9 16M)",
+            Quality::Youtube => "YouTube HQ (H.264 12M)",
             Quality::Balanced => "Smooth 60fps (VP8 8M)",
         }
     }
 }
 
-/// Default preset for THIS machine: 4 or fewer threads can't hold VP9-60fps
-/// next to a game, so pick Smooth (VP8); beefier machines get YouTube HQ.
+/// Default preset for THIS machine: Quick Sync (or 8+ threads) handles the
+/// YouTube preset; weak software-only PCs fall back to Smooth (VP8).
 pub fn auto_quality() -> Quality {
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    if n <= 4 {
-        Quality::Balanced
-    } else {
+    if qsv_available() || n > 4 {
         Quality::Youtube
+    } else {
+        Quality::Balanced
     }
 }
 
@@ -298,13 +330,25 @@ pub fn describe_source(cfg: &RecordConfig) -> Result<String> {
 }
 
 /// Resolve the output path: bare filename => joined under `dir`; a path with a
-/// directory component or drive letter is used as-is. Enforces `.webm`,
-/// creates parent folders, and auto-increments (`name_001.webm`) so recordings
-/// are never silently overwritten.
-pub fn resolve_output(output: &str, dir: &str) -> Result<String> {
+/// directory component or drive letter is used as-is. Forces the container
+/// the codec needs (`want_ext`: mp4 for H.264, webm for VP8/VP9), creates
+/// parent folders, and auto-increments (`name_001`) so recordings are never
+/// silently overwritten.
+pub fn resolve_output(output: &str, dir: &str, want_ext: &str) -> Result<String> {
     let mut out = output.to_owned();
-    if !out.to_lowercase().ends_with(".webm") {
-        out.push_str(".webm");
+    // Swap a mismatched container extension (gameplay.webm + H.264 => .mp4);
+    // append only when there is no usable extension at all.
+    let lower = out.to_lowercase();
+    let has_container_ext = lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".mkv");
+    if has_container_ext {
+        if let Some(dot) = out.rfind('.') {
+            out.truncate(dot);
+        }
+        out.push('.');
+        out.push_str(want_ext);
+    } else if !lower.ends_with(&format!(".{want_ext}")) {
+        out.push('.');
+        out.push_str(want_ext);
     }
     let p = Path::new(&out);
     let is_bare = p
@@ -552,12 +596,15 @@ fn spawn_ffmpeg(
     let enc: &str = match cfg.codec {
         Codec::Vp8 => "libvpx",
         Codec::Vp9 => "libvpx-vp9",
+        Codec::H264 => h264_encoder(),
     };
-    // Realtime-tuned libvpx args: lowest-latency path that still looks good.
-    // cpu-used 8 = fastest (lowest CPU), lower = better compression per bit
-    // (YouTube preset uses 5). row-mt + tiles let VP9 use all 4 threads.
+    // Realtime-tuned encoder args: lowest-latency path that still looks good.
+    // cpu-used 8 = fastest software (lowest CPU). H.264 uses hardware
+    // (Quick Sync) when present, else libx264 veryfast+zerolatency.
     let extra: Vec<String> = match cfg.codec {
         Codec::Vp8 => vec![
+            "-b:v".into(),
+            cfg.bitrate.clone(),
             "-deadline".into(),
             "realtime".into(),
             "-cpu-used".into(),
@@ -570,6 +617,8 @@ fn spawn_ffmpeg(
             (cfg.fps * 2).to_string(),
         ],
         Codec::Vp9 => vec![
+            "-b:v".into(),
+            cfg.bitrate.clone(),
             "-deadline".into(),
             "realtime".into(),
             "-cpu-used".into(),
@@ -589,7 +638,39 @@ fn spawn_ffmpeg(
             "-g".into(),
             (cfg.fps * 2).to_string(),
         ],
+        Codec::H264 => {
+            let kbps = bitrate_kbps(&cfg.bitrate);
+            let mut v = vec![
+                "-b:v".into(),
+                format!("{kbps}k"),
+                "-maxrate".into(),
+                format!("{}k", kbps * 3 / 2),
+                "-bufsize".into(),
+                format!("{}k", kbps * 2),
+                "-g".into(),
+                (cfg.fps * 2).to_string(),
+            ];
+            if enc == "h264_qsv" {
+                v.extend(["-preset".into(), "veryfast".into(), "-look_ahead".into(), "0".into()]);
+            } else {
+                v.extend(["-preset".into(), "veryfast".into(), "-tune".into(), "zerolatency".into()]);
+            }
+            v
+        }
     };
+
+/// "12M" / "8000k" / "8000000" -> kilobits per second (for maxrate/bufsize).
+fn bitrate_kbps(s: &str) -> u64 {
+    let t = s.trim().to_lowercase();
+    let kbps = if let Some(n) = t.strip_suffix('m') {
+        n.trim().parse::<f64>().unwrap_or(12.0) * 1000.0
+    } else if let Some(n) = t.strip_suffix('k') {
+        n.trim().parse::<f64>().unwrap_or(8000.0)
+    } else {
+        t.parse::<f64>().unwrap_or(12_000_000.0) / 1000.0
+    };
+    kbps.max(500.0) as u64
+}
 
     let threads = if cfg.threads == 0 {
         std::thread::available_parallelism()
@@ -641,8 +722,6 @@ fn spawn_ffmpeg(
     cmd.args([
         "-c:v",
         enc,
-        "-b:v",
-        &cfg.bitrate,
         "-threads",
         &threads.to_string(),
         "-pix_fmt",
@@ -1006,7 +1085,9 @@ pub struct Session {
 /// Start a recording. `preview` opens a latest-only preview tap for the GUI
 /// (the CLI passes false — zero preview cost).
 pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
-    let (tx, rx): (Sender<Packet>, Receiver<Packet>) = crossbeam_channel::bounded(2);
+    // Depth 3 (~25 MB worst case): absorbs the ~1 s ffmpeg/QSV spin-up burst
+    // so the first seconds don't drop; steady state still can't balloon.
+    let (tx, rx): (Sender<Packet>, Receiver<Packet>) = crossbeam_channel::bounded(3);
     let (ptx, prx) = if preview {
         let (t, r) = crossbeam_channel::bounded::<PreviewFrame>(1);
         (Some(t), Some(r))
