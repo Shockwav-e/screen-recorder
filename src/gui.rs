@@ -83,6 +83,7 @@ pub struct GuiApp {
     quality: Quality,
     bitrate_sel: usize,
     res_sel: usize,
+    enc_sel: usize,
     audio: AudioMode,
     fps60: bool,
     no_cursor: bool,
@@ -139,6 +140,7 @@ impl GuiApp {
                 Quality::Youtube => 2,
             },
             res_sel: 0, // native app size
+            enc_sel: 0, // auto: best for this PC
             audio: AudioMode::System,
             fps60: true,
             no_cursor: false,
@@ -211,6 +213,19 @@ impl GuiApp {
         BITRATES[self.bitrate_sel.min(BITRATES.len() - 1)].to_owned()
     }
 
+    /// Manual encoder override (None = follow the quality preset).
+    fn enc_override(&self) -> Option<Codec> {
+        match self.enc_sel {
+            1 => Some(Codec::H264),
+            2 => Some(Codec::H264Qsv),
+            3 => Some(Codec::H264Nvenc),
+            4 => Some(Codec::H264Amf),
+            5 => Some(Codec::Vp8),
+            6 => Some(Codec::Vp9),
+            _ => None,
+        }
+    }
+
     fn start(&mut self) {
         self.done_msg = None;
         self.error_msg = None;
@@ -237,7 +252,7 @@ impl GuiApp {
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "gameplay.webm".to_owned());
-        let codec: Codec = self.quality.codec();
+        let codec: Codec = self.enc_override().unwrap_or_else(|| self.quality.codec());
         let output = match resolve_output(&fname, &self.dir, codec.container_ext()) {
             Ok(p) => p,
             Err(e) => {
@@ -337,7 +352,16 @@ impl GuiApp {
                                 done.output, s.written, s.dropped
                             ));
                         }
-                        Err(e) => self.error_msg = Some(format!("recording failed: {e}")),
+                        Err(e) => {
+                            if std::fs::metadata(&done.output)
+                                .map(|m| m.len())
+                                .unwrap_or(u64::MAX)
+                                < 4096
+                            {
+                                let _ = std::fs::remove_file(&done.output);
+                            }
+                            self.error_msg = Some(format!("recording failed: {e}"));
+                        }
                     }
                     self.refresh_library();
                 }
@@ -646,6 +670,25 @@ impl eframe::App for GuiApp {
                             .show_ui(ui, |ui| {
                                 for (i, l) in RES_LABELS.iter().enumerate() {
                                     ui.selectable_value(&mut self.res_sel, i, *l);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Encoder:");
+                        let enc_names = [
+                            "Auto (best for this PC)",
+                            "H.264 auto",
+                            "H.264 Intel Quick Sync",
+                            "H.264 NVIDIA NVENC",
+                            "H.264 AMD AMF",
+                            "VP8 WebM",
+                            "VP9 WebM",
+                        ];
+                        egui::ComboBox::from_id_salt("enc")
+                            .selected_text(enc_names[self.enc_sel.min(enc_names.len() - 1)])
+                            .show_ui(ui, |ui| {
+                                for (i, n) in enc_names.iter().enumerate() {
+                                    ui.selectable_value(&mut self.enc_sel, i, *n);
                                 }
                             });
                     });

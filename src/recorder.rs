@@ -33,48 +33,117 @@ use windows_capture::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Codec {
-    /// WebM VP8 — ~30-40% cheaper CPU than VP9. Best for weak CPUs / long sessions.
-    Vp8,
-    /// WebM VP9 — better compression at the same bitrate. Best for YouTube uploads.
-    Vp9,
-    /// H.264 MP4 — Intel Quick Sync hardware encode when available
-    /// (near-zero CPU), libx264 fallback. Best all-rounder for YouTube.
+    /// Auto: best available on this PC — Intel QSV, then NVIDIA NVENC, then
+    /// AMD AMF, then software x264. MP4. The default: fastest smooth option.
     H264,
+    /// Intel Quick Sync H.264 (forced). MP4. Near-zero CPU on Intel iGPUs.
+    H264Qsv,
+    /// NVIDIA NVENC H.264 (forced). MP4. Needs an NVIDIA GPU + driver.
+    H264Nvenc,
+    /// AMD AMF H.264 (forced). MP4. Needs an AMD GPU + driver.
+    H264Amf,
+    /// WebM VP8 software — lightest CPU, universal playback.
+    Vp8,
+    /// WebM VP9 software — better compression, needs more CPU.
+    Vp9,
 }
 
 impl Codec {
     /// Container this codec needs (WebM can't hold H.264).
     pub fn container_ext(self) -> &'static str {
         match self {
-            Codec::H264 => "mp4",
+            Codec::H264 | Codec::H264Qsv | Codec::H264Nvenc | Codec::H264Amf => "mp4",
             _ => "webm",
         }
     }
 }
 
-/// True when Intel Quick Sync H.264 is usable (cached — one ~200 ms probe).
-/// NVENC is irrelevant here (no NVIDIA GPU); QSV is this machine's HW path.
-pub fn qsv_available() -> bool {
-    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Probe results for the hardware encoders, cached after first use.
+#[derive(Debug, Clone, Copy, Default)]
+struct HwEncoders {
+    qsv: bool,
+    nvenc: bool,
+    amf: bool,
+}
+
+fn probe_hw_encoders() -> HwEncoders {
+    static PROBE: std::sync::OnceLock<HwEncoders> = std::sync::OnceLock::new();
     *PROBE.get_or_init(|| {
-        let ff = ffmpeg_sidecar::paths::ffmpeg_path();
-        std::process::Command::new(ff)
-            .args(["-hide_banner", "-h", "encoder=h264_qsv"])
-            .output()
-            .map(|o| {
-                o.status.success()
-                    && String::from_utf8_lossy(&o.stdout).contains("h264_qsv")
-            })
-            .unwrap_or(false)
+        // Listing an encoder proves nothing (NVENC is listed with no NVIDIA
+        // card here) — do a real 5-frame hardware encode to know it inits.
+        let works = |enc: &str| {
+            std::process::Command::new(ffmpeg_sidecar::paths::ffmpeg_path())
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "nullsrc=s=64x64:r=30:d=1",
+                    "-frames:v",
+                    "5",
+                    "-c:v",
+                    enc,
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        HwEncoders { qsv: works("h264_qsv"), nvenc: works("h264_nvenc"), amf: works("h264_amf") }
     })
 }
 
-/// Concrete H.264 encoder: Quick Sync hardware, else libx264 software.
-pub fn h264_encoder() -> &'static str {
-    if qsv_available() {
-        "h264_qsv"
-    } else {
-        "libx264"
+/// True when Intel Quick Sync H.264 is usable (this PC's hardware path).
+pub fn qsv_available() -> bool {
+    probe_hw_encoders().qsv
+}
+
+/// Concrete ffmpeg encoder for a codec choice. Auto prefers hardware in
+/// QSV -> NVENC -> AMF order, then software x264. Forced vendors bail with
+/// a clear message when their GPU/driver is missing.
+pub fn video_encoder(codec: Codec) -> Result<&'static str> {
+    let hw = probe_hw_encoders();
+    match codec {
+        Codec::H264Qsv => hw
+            .qsv
+            .then_some("h264_qsv")
+            .context("Intel Quick Sync not available (needs an Intel iGPU + driver)"),
+        Codec::H264Nvenc => hw
+            .nvenc
+            .then_some("h264_nvenc")
+            .context("NVIDIA NVENC not available (needs an NVIDIA GPU + driver)"),
+        Codec::H264Amf => hw
+            .amf
+            .then_some("h264_amf")
+            .context("AMD AMF not available (needs an AMD GPU + driver)"),
+        Codec::H264 => Ok(if hw.qsv {
+            "h264_qsv"
+        } else if hw.nvenc {
+            "h264_nvenc"
+        } else if hw.amf {
+            "h264_amf"
+        } else {
+            "libx264"
+        }),
+        Codec::Vp8 => Ok("libvpx"),
+        Codec::Vp9 => Ok("libvpx-vp9"),
+    }
+}
+
+/// Short display name for a concrete encoder id.
+pub fn encoder_display(enc: &'static str) -> &'static str {
+    match enc {
+        "h264_qsv" => "H.264-QuickSync",
+        "h264_nvenc" => "H.264-NVENC",
+        "h264_amf" => "H.264-AMF",
+        "libx264" => "H.264-x264",
+        "libvpx" => "VP8",
+        "libvpx-vp9" => "VP9",
+        _ => enc,
     }
 }
 
@@ -593,14 +662,10 @@ fn spawn_ffmpeg(
 ) -> Result<ffmpeg_sidecar::child::FfmpegChild> {
     let _ = ffmpeg_sidecar::download::auto_download().context("ffmpeg auto-download failed");
 
-    let enc: &str = match cfg.codec {
-        Codec::Vp8 => "libvpx",
-        Codec::Vp9 => "libvpx-vp9",
-        Codec::H264 => h264_encoder(),
-    };
+    let enc: &str = video_encoder(cfg.codec)?;
     // Realtime-tuned encoder args: lowest-latency path that still looks good.
-    // cpu-used 8 = fastest software (lowest CPU). H.264 uses hardware
-    // (Quick Sync) when present, else libx264 veryfast+zerolatency.
+    // cpu-used 8 = fastest software (lowest CPU). H.264 prefers hardware
+    // (QSV/NVENC/AMF), else libx264 veryfast+zerolatency.
     let extra: Vec<String> = match cfg.codec {
         Codec::Vp8 => vec![
             "-b:v".into(),
@@ -638,7 +703,7 @@ fn spawn_ffmpeg(
             "-g".into(),
             (cfg.fps * 2).to_string(),
         ],
-        Codec::H264 => {
+        Codec::H264 | Codec::H264Qsv | Codec::H264Nvenc | Codec::H264Amf => {
             let kbps = bitrate_kbps(&cfg.bitrate);
             let mut v = vec![
                 "-b:v".into(),
@@ -650,10 +715,26 @@ fn spawn_ffmpeg(
                 "-g".into(),
                 (cfg.fps * 2).to_string(),
             ];
-            if enc == "h264_qsv" {
-                v.extend(["-preset".into(), "veryfast".into(), "-look_ahead".into(), "0".into()]);
-            } else {
-                v.extend(["-preset".into(), "veryfast".into(), "-tune".into(), "zerolatency".into()]);
+            match enc {
+                "h264_qsv" => v.extend([
+                    "-preset".into(),
+                    "veryfast".into(),
+                    "-look_ahead".into(),
+                    "0".into(),
+                ]),
+                "h264_nvenc" => v.extend([
+                    "-preset".into(),
+                    "p4".into(),
+                    "-tune".into(),
+                    "ll".into(),
+                ]),
+                "h264_amf" => v.extend(["-quality".into(), "speed".into()]),
+                _ => v.extend([
+                    "-preset".into(),
+                    "veryfast".into(),
+                    "-tune".into(),
+                    "zerolatency".into(),
+                ]),
             }
             v
         }
@@ -807,8 +888,13 @@ fn writer_loop(
                 break;
             }
         }
-        drop(stdin); // EOF -> ffmpeg finalizes the .webm
-        let _ = child.wait();
+        drop(stdin); // EOF -> ffmpeg finalizes the .webm/.mp4
+        // Loud failure beats a silent empty file: a bad encoder (or dead
+        // ffmpeg) must surface, not produce 0-byte recordings.
+        let status = child.wait().context("ffmpeg wait failed")?;
+        if !status.success() {
+            anyhow::bail!("ffmpeg exited with {status} — encoder failed to start?");
+        }
         Ok(())
     })();
     if let Err(e) = res {

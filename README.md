@@ -53,7 +53,10 @@ Note: per-app-only audio needs Windows 11+ — on Windows 10, mute other apps
   Intel Quick Sync encodes in hardware (single-digit CPU), and H.264 MP4 is
   YouTube's preferred upload format. Falls back to libx264 if no QSV driver.
 - `--quality smooth`: **VP8 WebM @ 8M**, pure software, lowest CPU.
-- `--codec vp8|vp9|h264`, `--bitrate`, `--cpu-used` override the preset.
+- `--codec h264` (auto: QSV → NVENC → AMF → x264), `h264-qsv`, `h264-nvenc`,
+  `h264-amf`, `vp8`, `vp9` — forced vendor options fail fast with a clear
+  message when their GPU is missing, and never leave empty files behind.
+- `--bitrate`, `--cpu-used` override the preset.
 - Fast-motion games need bits: 12M H.264 or 10–12M VP8.
 - If drops climb: close background apps or `--fps 30`.
 

@@ -19,7 +19,8 @@ use clap::Parser;
 
 use recorder::{
     AudioMode, Codec, Quality, RecordConfig, Source, auto_quality, describe_source,
-    list_monitors, list_windows, resolve_output, resolve_size, start_session,
+    encoder_display, list_monitors, list_windows, resolve_output, resolve_size, start_session,
+    video_encoder,
 };
 
 #[derive(Parser, Debug)]
@@ -191,16 +192,13 @@ fn main() -> Result<()> {
     let src_desc = describe_source(&cfg)
         .with_context(|| "source unavailable — try --list-windows / --list-monitors")?;
 
-    let enc_name: &str = match codec {
-        Codec::H264 => {
-            if recorder::h264_encoder() == "h264_qsv" {
-                "H.264-QuickSync"
-            } else {
-                "H.264-x264"
-            }
+    let enc_name: &str = match video_encoder(codec) {
+        Ok(enc) => encoder_display(enc),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            eprintln!("hint: use --codec h264 (auto) or vp8 — run --help for all encoders.");
+            std::process::exit(2);
         }
-        Codec::Vp8 => "VP8",
-        Codec::Vp9 => "VP9",
     };
     println!("shockwave  |  {src_desc}");
     println!(
@@ -254,10 +252,19 @@ fn main() -> Result<()> {
         );
         last_w = s.written;
     }
-    let s = session.wait()?;
-    println!(
-        "done      |  saved (captured={} dropped={} written={}; drops = realtime pacing, normal)",
-        s.captured, s.dropped, s.written,
-    );
+    let out_path = session.output().to_owned();
+    match session.wait() {
+        Ok(s) => println!(
+            "done      |  saved (captured={} dropped={} written={}; drops = realtime pacing, normal)",
+            s.captured, s.dropped, s.written,
+        ),
+        Err(e) => {
+            // Don't leave a useless 0-byte file behind on encoder failure.
+            if std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(u64::MAX) < 4096 {
+                let _ = std::fs::remove_file(&out_path);
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
