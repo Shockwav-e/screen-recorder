@@ -49,7 +49,6 @@ pub struct GuiApp {
     bitrate_sel: usize,
     fps60: bool,
     no_cursor: bool,
-    border: bool,
     auto_stop: bool,
     stop_secs: u32,
 
@@ -97,7 +96,6 @@ impl GuiApp {
             bitrate_sel: 3, // 16M
             fps60: true,
             no_cursor: false,
-            border: false,
             auto_stop: false,
             stop_secs: 60,
             phase: Phase::Idle,
@@ -185,7 +183,6 @@ impl GuiApp {
             threads: 4,
             duration: self.auto_stop.then_some(self.stop_secs.max(5) as u64),
             no_cursor: self.no_cursor,
-            border: self.border,
         };
         // Validate the source exists before claiming "recording".
         if let Err(e) = describe_source(&cfg) {
@@ -438,10 +435,6 @@ impl eframe::App for GuiApp {
                         ui.add_enabled(
                             !recording,
                             egui::Checkbox::new(&mut self.no_cursor, "Hide cursor"),
-                        );
-                        ui.add_enabled(
-                            !recording,
-                            egui::Checkbox::new(&mut self.border, "Capture border"),
                         );
                         ui.add_enabled(
                             !recording,

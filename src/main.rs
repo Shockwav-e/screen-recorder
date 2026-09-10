@@ -143,8 +143,10 @@ fn main() -> Result<()> {
         threads: args.threads,
         duration: args.duration,
         no_cursor: args.no_cursor,
-        border: args.border,
     };
+    if args.border {
+        eprintln!("NOTE: --border needs Windows 11 and is ignored on Windows 10.");
+    }
 
     let src_desc = describe_source(&cfg)
         .with_context(|| "source unavailable — try --list-windows / --list-monitors")?;

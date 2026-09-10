@@ -1,71 +1,91 @@
-# lite-rec — lightweight Rust screen/window recorder (WebM 1080p60)
+# Shockwave Screen Recorder — lightweight Rust game recorder (WebM 1080p60)
 
 OBS-like capture for Windows, built in Rust. Records **monitor or specific window**
-to **WebM (VP8/VP9)** at **60fps 1080p**, tuned for low CPU/RAM.
+to **WebM (VP8/VP9)** at **60fps 1080p**. Ships with a **modern native GUI**
+and a scriptable **CLI**, tuned for low CPU/RAM and YouTube-ready quality.
+
+## GUI or CLI
+
+```powershell
+cargo build --release
+
+# modern interface (recommended)
+.\target\release\shockwave-rec.exe --gui
+
+# headless / scripted
+.\target\release\shockwave-rec.exe --quality youtube --output gameplay.webm
+```
+
+The GUI has a source picker (monitor dropdown / window list with filter),
+save-folder browser, quality presets, and live stats (fps, captured, dropped).
+It repaints at 5 Hz while recording and idles at ~0% CPU otherwise — and
+skips live preview on purpose (a preview would steal GPU from your game).
 
 ## Your machine vs requirements
 
 | Part | You | Verdict |
 |---|---|---|
-| CPU i5-4570 (4C/4T Haswell) | no VP9 HW encode | use **VP8 default** (~15–25% CPU); VP9 ≈ 35–55% |
+| CPU i5-4570 (4C/4T Haswell) | no VP9 HW encode | Balanced VP8 ≈ 15–25% CPU; YouTube VP9 ≈ 35–55% |
 | RAM 16 GB | plenty | recorder uses ~60–120 MB (2-frame queue) |
-| Display 1920×1080 | exact match | **zero scaler cost** |
-| Disk 37 GB free | fine | ~45 MB/min at 6M bitrate |
+| Display 1920×1080 @100Hz | exact match | **zero scaler cost** |
+| Disk 37 GB free | fine | ~120 MB/min at 16M bitrate |
 | GPU HD 4600 | WGC capture is GPU-composited | near-zero capture overhead |
+
+## Quality for YouTube
+
+YouTube re-encodes every upload, so upload a high-bitrate master:
+
+- `--quality youtube` (default): **VP9 1080p60 @ 16M**, cpu-used 5.
+  YouTube wants ~12 Mbps for 1080p60 — a 16M master keeps it sharp.
+- `--quality balanced`: **VP8 1080p60 @ 8M**, cpu-used 8 (fastest).
+  Lowest CPU, good for drafts and long sessions.
+- `--codec / --bitrate / --cpu-used` override the preset.
+- Fast-motion games need bits: 16–20M VP9 or 10–12M VP8.
+- If you see drops climbing: switch to Balanced or `--fps 30`.
 
 ## Local games (e.g. Modern Warships)
 
 - Run the game in **borderless windowed** mode if fullscreen capture is black
-  (WGC can't see exclusive fullscreen — same limit as OBS display capture). Then:
-  - `lite-rec --window "Modern Warships" --codec vp8 --bitrate 10M` (window-only, clean), or
-  - `lite-rec --monitor 1 --codec vp8 --bitrate 10M` (whole screen).
-- Fast-motion games need more bits: **10–12M** for VP8, **8–10M** for VP9.
-  Default 6M is for desktop; games at 6M will block/pixelate on motion.
-- If CPU spikes: drop to `--fps 30` (halves encode cost) or keep `--cpu-used 8`.
+  (WGC can't see exclusive fullscreen — same limit as OBS display capture).
+- Window-only (clean, like OBS Game Capture):
+  `shockwave-rec --window "Modern Warships" --quality youtube`
+- Whole screen: `shockwave-rec --monitor 1 --quality youtube`
+- 10-second test: `--window "Modern Warships" --duration 10 --output test.webm`
 
 ## Usage
 
 ```powershell
-cargo build --release
+# recordings land in D:\Recordings by default (auto-created, never overwritten —
+# existing names get _001, _002…)
+shockwave-rec --output gameplay.webm             # => D:\Recordings\gameplay.webm
+shockwave-rec --dir "D:\Videos" --output game.webm
+shockwave-rec --output "D:\Clips\warships.webm"  # full path bypasses --dir
 
-# recordings land in D:\Recordings by default (auto-created)
-.\target\release\lite-rec.exe --output out.webm            # => D:\Recordings\out.webm
-.\target\release\lite-rec.exe --dir "D:\Videos" --output game.webm   # => D:\Videos\game.webm
-.\target\release\lite-rec.exe --output "D:\Clips\warships.webm"      # full path bypasses --dir
+# list targets
+shockwave-rec --list-monitors
+shockwave-rec --list-windows
 
-# list targets (OBS-like picker, CLI version)
-.\target\release\lite-rec.exe --list-monitors
-.\target\release\lite-rec.exe --list-windows
-
-# fullscreen 1080p60 WebM (VP8 = lowest CPU on your i5)
-.\target\release\lite-rec.exe --output out.webm
-
-# specific window, game-ready bitrate
-.\target\release\lite-rec.exe --window "Notepad" --bitrate 10M --output game.webm
-
-# 10-second test clip
-.\target\release\lite-rec.exe --window "Modern Warships" --duration 10 --output test.webm
-
-# VP9 (better compression, more CPU) / no cursor / 30fps fallback
-.\target\release\lite-rec.exe --codec vp9 --bitrate 8M --output hq.webm
-.\target\release\lite-rec.exe --no-cursor --output clean.webm
-.\target\release\lite-rec.exe --fps 30 --output light.webm
+# overrides / fallbacks
+shockwave-rec --codec vp8 --bitrate 10M --output light.webm
+shockwave-rec --fps 30 --output light30.webm
+shockwave-rec --no-cursor --output clean.webm
 ```
 
 Stop with **Enter** or **Ctrl+C** — the `.webm` is finalized cleanly.
+`--border` is accepted but needs Windows 11; on Windows 10 it's ignored.
 
 ## How it stays light
 
 - Windows Graphics Capture API (GPU-composited, event-driven — idle screen ≈ 0% CPU)
 - Fixed 1920×1080 pipe, center crop/pad in-Rust (cheap memcpy, no scaler)
 - Bounded 2-frame channel + `try_send` (never blocks capture; drops = realtime, like OBS)
-- Buffer reuse (no per-frame alloc), CFR pacer thread, `deadline realtime / cpu-used 8`
+- Buffer reuse (no per-frame alloc), CFR pacer thread, realtime libvpx flags
 - FFmpeg auto-downloaded on first run (no manual install needed)
+- Zero `unsafe`, no unwraps on hot paths, all numeric inputs clamped
 
-## Flags
+## Branding
 
-```
---output, --dir (default D:\Recordings), --fps, --width/--height, --monitor N, --window "title..."
---list-windows, --list-monitors, --codec vp8|vp9, --bitrate 6M
---cpu-used 8, --threads 4, --duration N, --no-cursor, --border
-```
+`assets/Shockwave.png` is the master logo. `assets/icon-{16,32,48,64,256}.png`
+are generated sizes; `build.rs` packs them into a multi-image `icon.ico` at
+build time and embeds it in the exe (taskbar, Alt-Tab, shortcuts), while the
+GUI sets the same art as its window icon at runtime.

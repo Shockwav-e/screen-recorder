@@ -104,7 +104,6 @@ pub struct RecordConfig {
     pub threads: u32,
     pub duration: Option<u64>,
     pub no_cursor: bool,
-    pub border: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -460,7 +459,10 @@ fn spawn_ffmpeg(cfg: &RecordConfig) -> Result<ffmpeg_sidecar::child::FfmpegChild
     for e in &extra {
         cmd.arg(e);
     }
-    cmd.args(["-vsync", "cfr", &cfg.output]);
+    // NOTE: no -vsync/-fps_mode flag on purpose. Our writer thread already
+    // paces stdin at exactly CFR, and the vsync option was removed in recent
+    // ffmpeg builds (Unrecognized option 'vsync') — passing it kills ffmpeg.
+    cmd.arg(&cfg.output);
     cmd.spawn().context(
         "failed to spawn ffmpeg. Install it (winget install Gyan.FFmpeg) or let lite-rec auto-download it",
     )
@@ -589,11 +591,9 @@ pub fn start_session(cfg: RecordConfig) -> Result<Session> {
             } else {
                 CursorCaptureSettings::WithCursor
             };
-            let border = if cfg.border {
-                DrawBorderSettings::WithBorder
-            } else {
-                DrawBorderSettings::WithoutBorder
-            };
+            // NOTE: Win10 (like this machine) rejects explicit border toggling —
+            // only Default is accepted. Win11 supports With/WithoutBorder.
+            let border = DrawBorderSettings::Default;
             let res: Result<()> = (|| -> Result<()> {
                 match &cfg.source {
                 Source::Window { needle } => {
