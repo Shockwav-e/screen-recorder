@@ -16,10 +16,12 @@ cargo build --release
 .\target\release\shockwave-rec.exe --quality youtube --output gameplay.webm
 ```
 
-The GUI has a source picker (monitor dropdown / window list with filter),
-save-folder browser, quality presets, and live stats (fps, captured, dropped).
-It repaints at 5 Hz while recording and idles at ~0% CPU otherwise — and
-skips live preview on purpose (a preview would steal GPU from your game).
+The GUI has a **live preview** (480p, 10 fps tap — what you see is what's
+saved), an **app picker** (monitor dropdown, or filterable window list with a
+green "Will record" confirmation), save-folder browser, quality presets, and
+live stats (fps, captured, dropped). Finished videos appear in a
+**recordings library** with Play / Delete / Open-folder actions.
+It repaints at ~10 Hz while recording and idles at ~0% CPU otherwise.
 
 ## Your machine vs requirements
 

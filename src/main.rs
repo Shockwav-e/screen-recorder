@@ -166,7 +166,7 @@ fn main() -> Result<()> {
         println!("note      |  VP9 on 4-thread Haswell ~= 35-55% CPU; --quality balanced for ~15-25%.");
     }
 
-    let session = start_session(cfg)?;
+    let session = start_session(cfg, false)?;
     println!("recording |  {}  (Enter or Ctrl+C to stop)", session.output());
 
     // Graceful stop: Ctrl+C or Enter finalizes the .webm instead of corrupting it.

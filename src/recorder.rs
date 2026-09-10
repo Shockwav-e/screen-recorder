@@ -245,6 +245,31 @@ fn unique_path(path: &Path) -> PathBuf {
 /// A finished BGRA frame ready for ffmpeg stdin.
 type Packet = Vec<u8>;
 
+/// A small RGBA frame for the GUI live preview (480px wide, ~10 fps).
+/// Kept tiny on purpose: ~500 KB per frame, latest-only channel.
+#[derive(Debug, Clone, Default)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Downscale BGRA `src` (sw×sh) to ~480px-wide RGBA with nearest-neighbor.
+/// Cheap (~130k pixel copies for 1080p) — runs at most 10×/s.
+fn downscale_bgra_to_rgba(src: &[u8], sw: u32, sh: u32) -> PreviewFrame {
+    let step = (sw / 480).max(1);
+    let pw = sw / step;
+    let ph = sh / step;
+    let mut rgba = Vec::with_capacity((pw as usize) * (ph as usize) * 4);
+    for y in 0..ph {
+        for x in 0..pw {
+            let s = (((y * step) as usize) * (sw as usize) + ((x * step) as usize)) * 4;
+            rgba.extend_from_slice(&[src[s + 2], src[s + 1], src[s], 255]);
+        }
+    }
+    PreviewFrame { width: pw, height: ph, rgba }
+}
+
 /// Lock the shared error slot, tolerating a poisoned mutex (a crashed thread
 /// must never take the whole app down with it).
 fn lock_err(m: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
@@ -254,6 +279,7 @@ fn lock_err(m: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<Strin
 #[derive(Clone)]
 struct PipeFlags {
     tx: Sender<Packet>,
+    preview: Option<Sender<PreviewFrame>>,
     out_w: u32,
     out_h: u32,
     stop: Arc<AtomicBool>,
@@ -264,12 +290,14 @@ struct PipeFlags {
 
 struct Recorder {
     tx: Sender<Packet>,
+    preview: Option<Sender<PreviewFrame>>,
     out_w: u32,
     out_h: u32,
     stop: Arc<AtomicBool>,
     captured: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     deadline: Option<Instant>,
+    last_preview: Instant,
     /// reused scratch for de-padding (no alloc per frame)
     nopad: Vec<u8>,
     /// reused scratch for fitted output (no alloc per frame)
@@ -285,12 +313,14 @@ impl GraphicsCaptureApiHandler for Recorder {
         let px = (f.out_w as usize) * (f.out_h as usize) * 4;
         Ok(Self {
             tx: f.tx,
+            preview: f.preview,
             out_w: f.out_w,
             out_h: f.out_h,
             stop: f.stop,
             captured: f.captured,
             dropped: f.dropped,
             deadline: f.deadline,
+            last_preview: Instant::now() - Duration::from_secs(1),
             nopad: Vec::with_capacity(1920 * 1080 * 4),
             fitted: vec![0u8; px],
         })
@@ -326,6 +356,19 @@ impl GraphicsCaptureApiHandler for Recorder {
         }
         fit_bgra_center(tmp, sw, sh, &mut self.fitted, self.out_w, self.out_h);
         self.captured.fetch_add(1, Ordering::Relaxed);
+        // Live preview for the GUI: downscaled copy at most every 100 ms,
+        // latest-only channel. Must run BEFORE the try_send below moves
+        // `fitted` away. Zero cost when no preview consumer exists.
+        if let Some(ptx) = &self.preview {
+            let now = Instant::now();
+            if now.duration_since(self.last_preview) >= Duration::from_millis(100) {
+                self.last_preview = now;
+                let small = downscale_bgra_to_rgba(&self.fitted, self.out_w, self.out_h);
+                // depth-1 channel: if the GUI hasn't drained yet, drop this
+                // frame (latest wins next tick) — never block capture.
+                let _ = ptx.try_send(small);
+            }
+        }
         // Never block the capture thread (blocks = lag + RAM growth).
         // Channel depth 2 keeps RAM flat; drops = realtime pacing, like OBS.
         match self.tx.try_send(std::mem::replace(
@@ -552,10 +595,19 @@ pub struct Session {
     started: Instant,
     capture: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+    preview_rx: Option<Receiver<PreviewFrame>>,
 }
 
-pub fn start_session(cfg: RecordConfig) -> Result<Session> {
+/// Start a recording. `preview` opens a latest-only preview tap for the GUI
+/// (the CLI passes false — zero preview cost).
+pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
     let (tx, rx): (Sender<Packet>, Receiver<Packet>) = crossbeam_channel::bounded(2);
+    let (ptx, prx) = if preview {
+        let (t, r) = crossbeam_channel::bounded::<PreviewFrame>(1);
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let captured = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
@@ -579,6 +631,7 @@ pub fn start_session(cfg: RecordConfig) -> Result<Session> {
         std::thread::spawn(move || {
             let flags = PipeFlags {
                 tx,
+                preview: ptx,
                 out_w: cfg.width,
                 out_h: cfg.height,
                 stop: stop.clone(),
@@ -646,6 +699,7 @@ pub fn start_session(cfg: RecordConfig) -> Result<Session> {
         started: Instant::now(),
         capture: Some(capture),
         writer: Some(writer),
+        preview_rx: prx,
     })
 }
 
@@ -658,6 +712,10 @@ impl Session {
     }
     pub fn output(&self) -> &str {
         &self.output
+    }
+    /// Latest-only preview tap (GUI). Drains with try_recv; may be None (CLI).
+    pub fn preview_rx(&self) -> Option<&Receiver<PreviewFrame>> {
+        self.preview_rx.as_ref()
     }
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()

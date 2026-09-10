@@ -1,12 +1,14 @@
-//! Modern native GUI for lite-rec (egui/eframe — GPU-accelerated, no webview).
+//! Shockwave Screen Recorder GUI (egui/eframe — GPU-accelerated, no webview).
+//!
+//! Normal-recorder layout: live preview + transport on top, source / output /
+//! quality sections below, recordings library at the bottom.
 //!
 //! Performance best practices applied:
 //!   - UI thread never blocks: capture + encode run on background threads,
 //!     `Session::wait()` finalizes on a helper thread during Stop.
-//!   - Repaints throttled to 5 Hz while recording (stats only); fully static
-//!     when idle — the UI costs ~0% CPU otherwise.
-//!   - No live preview: on an HD 4600 a preview texture upload + composite per
-//!     frame would steal GPU/CPU from the game being recorded. Stats instead.
+//!   - Repaints throttled to ~10 Hz while recording; fully static when idle.
+//!   - Preview is a 480px, 10 fps, latest-only tap (~0.5 MB/frame) — cheap
+//!     enough for an HD 4600 while a game runs.
 
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -33,6 +35,36 @@ struct StopOutcome {
     result: std::result::Result<Snapshot, String>,
 }
 
+struct LibFile {
+    name: String,
+    path: String,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+fn fmt_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.0} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn fmt_age(modified: std::time::SystemTime) -> String {
+    let s = modified.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86400)
+    }
+}
+
 pub struct GuiApp {
     monitors: Vec<MonitorInfo>,
     windows: Vec<WindowInfo>,
@@ -55,6 +87,9 @@ pub struct GuiApp {
     phase: Phase,
     session: Option<Session>,
     pending: Option<Receiver<StopOutcome>>,
+    preview_tex: Option<egui::TextureHandle>,
+    show_preview: bool,
+    lib_files: Vec<LibFile>,
     start_t: Instant,
     snap: Snapshot,
     out_fps: f32,
@@ -101,6 +136,9 @@ impl GuiApp {
             phase: Phase::Idle,
             session: None,
             pending: None,
+            preview_tex: None,
+            show_preview: true,
+            lib_files: Vec::new(),
             start_t: Instant::now(),
             snap: Snapshot::default(),
             out_fps: 0.0,
@@ -110,7 +148,33 @@ impl GuiApp {
             error_msg: None,
         };
         app.refresh_sources();
+        app.refresh_library();
         app
+    }
+
+    /// Recordings library: .webm files in the save folder, newest first.
+    fn refresh_library(&mut self) {
+        self.lib_files.clear();
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return; // folder may not exist yet — created on first record
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e.eq_ignore_ascii_case("webm")).unwrap_or(false) {
+                if let Ok(md) = entry.metadata() {
+                    self.lib_files.push(LibFile {
+                        name: p
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        path: p.to_string_lossy().into_owned(),
+                        bytes: md.len(),
+                        modified: md.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    });
+                }
+            }
+        }
+        self.lib_files.sort_by(|a, b| b.modified.cmp(&a.modified));
     }
 
     fn refresh_sources(&mut self) {
@@ -189,13 +253,14 @@ impl GuiApp {
             self.error_msg = Some(format!("source unavailable: {e:?}"));
             return;
         }
-        match start_session(cfg) {
+        match start_session(cfg, true) {
             Ok(sess) => {
                 self.start_t = Instant::now();
                 self.last_t = Instant::now();
                 self.last_written = 0;
                 self.out_fps = 0.0;
                 self.snap = Snapshot::default();
+                self.preview_tex = None;
                 self.session = Some(sess);
                 self.phase = Phase::Recording;
             }
@@ -254,17 +319,46 @@ impl GuiApp {
                         }
                         Err(e) => self.error_msg = Some(format!("recording failed: {e}")),
                     }
+                    self.refresh_library();
                 }
             }
         }
+    }
+
+    /// Pull the latest preview frame (if any) and upload it as a texture.
+    /// Called on the UI thread at repaint rate; old texture is freed on replace.
+    fn poll_preview(&mut self, ctx: &egui::Context) {
+        if !self.show_preview {
+            return;
+        }
+        let Some(sess) = &self.session else { return };
+        let Some(rx) = sess.preview_rx() else { return };
+        let mut latest = None;
+        while let Ok(f) = rx.try_recv() {
+            latest = Some(f);
+        }
+        let Some(f) = latest else { return };
+        if (f.width as usize) * (f.height as usize) * 4 != f.rgba.len() || f.rgba.is_empty() {
+            return; // transient resize frame — skip, keep last good texture
+        }
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [f.width as usize, f.height as usize],
+            &f.rgba,
+        );
+        self.preview_tex =
+            Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR));
     }
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
-        // Throttled repaints while busy; static otherwise (0% idle UI cost).
-        if self.phase != Phase::Idle {
+        // Throttled repaints: ~10 Hz while recording (preview + stats),
+        // slower while finalizing, fully static when idle (0% UI cost).
+        if self.phase == Phase::Recording {
+            self.poll_preview(ctx);
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.phase != Phase::Idle {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
         let recording = self.phase != Phase::Idle;
@@ -286,10 +380,57 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // Live preview — what you see here is what gets saved.
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Preview");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.checkbox(&mut self.show_preview, "Live");
+                            },
+                        );
+                    });
+                    let avail = ui.available_width();
+                    let h = (avail * 9.0 / 16.0).clamp(120.0, 400.0);
+                    if self.show_preview {
+                        if let Some(tex) = &self.preview_tex {
+                            ui.add(
+                                egui::Image::new(tex)
+                                    .fit_to_exact_size(egui::vec2(avail, h)),
+                            );
+                        } else {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(avail, h),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                rect,
+                                8.0,
+                                egui::Color32::BLACK,
+                            );
+                            let msg = if recording {
+                                "Waiting for first frame…"
+                            } else {
+                                "Hit Record — this is exactly what gets saved"
+                            };
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                msg,
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::GRAY,
+                            );
+                        }
+                    } else {
+                        ui.weak("Preview off (saves a little CPU). Recording still runs full quality.");
+                    }
+                });
+
                 ui.add_space(4.0);
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.strong("1 · Source");
+                        ui.strong("1 · What to record");
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
@@ -363,6 +504,17 @@ impl eframe::App for GuiApp {
                                 self.win_sel = Some(i);
                             }
                         });
+                    }
+                    if self.use_window {
+                        match self.win_sel.and_then(|i| self.windows.get(i)) {
+                            Some(w) => ui.colored_label(
+                                egui::Color32::GREEN,
+                                format!("Will record: {}", w.title),
+                            ),
+                            None => ui.weak(
+                                "Select an app above — or use Monitor for fullscreen games.",
+                            ),
+                        };
                     }
                     if let Some(e) = &self.lists_error {
                         ui.colored_label(egui::Color32::YELLOW, e);
@@ -499,6 +651,79 @@ impl eframe::App for GuiApp {
                     }
                 });
 
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("4 · Recordings ({})", self.lib_files.len()));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.button("Open folder").clicked() {
+                                    if std::process::Command::new("explorer")
+                                        .arg(&self.dir)
+                                        .spawn()
+                                        .is_err()
+                                    {
+                                        self.error_msg =
+                                            Some("couldn't open the save folder".to_owned());
+                                    }
+                                }
+                                if ui.button("Refresh").clicked() {
+                                    self.refresh_library();
+                                }
+                            },
+                        );
+                    });
+                    if self.lib_files.is_empty() {
+                        ui.weak("No recordings yet — finished videos land here.");
+                    } else {
+                        let mut play_path: Option<String> = None;
+                        let mut del_idx: Option<usize> = None;
+                        egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+                            for (i, f) in self.lib_files.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let mut nm = f.name.clone();
+                                    if nm.len() > 32 {
+                                        nm.truncate(29);
+                                        nm.push_str("…");
+                                    }
+                                    ui.monospace(nm);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("Del").clicked() {
+                                                del_idx = Some(i);
+                                            }
+                                            if ui.small_button("Play").clicked() {
+                                                play_path = Some(f.path.clone());
+                                            }
+                                            ui.weak(format!(
+                                                "{} · {}",
+                                                fmt_size(f.bytes),
+                                                fmt_age(f.modified)
+                                            ));
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                        if let Some(p) = play_path {
+                            if std::process::Command::new("cmd")
+                                .args(["/C", "start", "", &p])
+                                .spawn()
+                                .is_err()
+                            {
+                                self.error_msg = Some(format!("couldn't play {p}"));
+                            }
+                        }
+                        if let Some(i) = del_idx {
+                            if let Some(f) = self.lib_files.get(i) {
+                                let _ = std::fs::remove_file(&f.path);
+                            }
+                            self.refresh_library();
+                        }
+                    }
+                });
+
                 if let Some(m) = &self.done_msg {
                     ui.add_space(4.0);
                     ui.colored_label(egui::Color32::GREEN, m);
@@ -510,7 +735,7 @@ impl eframe::App for GuiApp {
 
                 ui.add_space(4.0);
                 ui.separator();
-                ui.weak("Tip: run games borderless-windowed — exclusive fullscreen can't be captured (same in OBS). No live preview by design: it would steal GPU from your game.");
+                ui.weak("Tip: run games borderless-windowed — exclusive fullscreen can't be captured (same in OBS).");
             });
         });
     }
@@ -522,8 +747,8 @@ pub fn run() -> Result<()> {
             .expect("assets/icon-256.png is corrupt");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 760.0])
-            .with_min_inner_size([560.0, 640.0])
+            .with_inner_size([700.0, 980.0])
+            .with_min_inner_size([600.0, 700.0])
             .with_icon(icon),
         ..Default::default()
     };
