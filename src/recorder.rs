@@ -124,14 +124,30 @@ pub struct MonitorInfo {
 }
 
 pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    // Never offer our own window (recording it = feedback loop), and skip
+    // untitled helper windows — normal recorders hide both.
+    let own_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
     let wins = Window::enumerate().context("failed to enumerate windows")?;
     Ok(wins
         .iter()
-        .map(|w| WindowInfo {
-            title: w.title().unwrap_or_default(),
-            process: w.process_name().unwrap_or_default(),
-            w: w.width().unwrap_or(0),
-            h: w.height().unwrap_or(0),
+        .filter_map(|w| {
+            let title = w.title().unwrap_or_default();
+            if title.trim().is_empty() {
+                return None;
+            }
+            let proc_ = w.process_name().unwrap_or_default();
+            if !own_exe.is_empty() && proc_.to_lowercase() == own_exe {
+                return None;
+            }
+            Some(WindowInfo {
+                title,
+                process: proc_,
+                w: w.width().unwrap_or(0),
+                h: w.height().unwrap_or(0),
+            })
         })
         .collect())
 }
@@ -242,7 +258,7 @@ fn unique_path(path: &Path) -> PathBuf {
 
 // ---------- capture plumbing ----------
 
-/// A finished BGRA frame ready for ffmpeg stdin.
+/// A finished RGBA frame ready for ffmpeg stdin.
 type Packet = Vec<u8>;
 
 /// A small RGBA frame for the GUI live preview (480px wide, ~10 fps).
@@ -254,9 +270,9 @@ pub struct PreviewFrame {
     pub rgba: Vec<u8>,
 }
 
-/// Downscale BGRA `src` (sw×sh) to ~480px-wide RGBA with nearest-neighbor.
+/// Downscale RGBA `src` (sw×sh) to ~480px-wide RGBA with nearest-neighbor.
 /// Cheap (~130k pixel copies for 1080p) — runs at most 10×/s.
-fn downscale_bgra_to_rgba(src: &[u8], sw: u32, sh: u32) -> PreviewFrame {
+fn downscale_rgba_preview(src: &[u8], sw: u32, sh: u32) -> PreviewFrame {
     let step = (sw / 480).max(1);
     let pw = sw / step;
     let ph = sh / step;
@@ -264,7 +280,7 @@ fn downscale_bgra_to_rgba(src: &[u8], sw: u32, sh: u32) -> PreviewFrame {
     for y in 0..ph {
         for x in 0..pw {
             let s = (((y * step) as usize) * (sw as usize) + ((x * step) as usize)) * 4;
-            rgba.extend_from_slice(&[src[s + 2], src[s + 1], src[s], 255]);
+            rgba.extend_from_slice(&[src[s], src[s + 1], src[s + 2], 255]);
         }
     }
     PreviewFrame { width: pw, height: ph, rgba }
@@ -354,7 +370,7 @@ impl GraphicsCaptureApiHandler for Recorder {
         if tmp.len() < (sw as usize) * (sh as usize) * 4 {
             return Ok(()); // malformed frame, skip
         }
-        fit_bgra_center(tmp, sw, sh, &mut self.fitted, self.out_w, self.out_h);
+        fit_frame_center(tmp, sw, sh, &mut self.fitted, self.out_w, self.out_h);
         self.captured.fetch_add(1, Ordering::Relaxed);
         // Live preview for the GUI: downscaled copy at most every 100 ms,
         // latest-only channel. Must run BEFORE the try_send below moves
@@ -363,7 +379,7 @@ impl GraphicsCaptureApiHandler for Recorder {
             let now = Instant::now();
             if now.duration_since(self.last_preview) >= Duration::from_millis(100) {
                 self.last_preview = now;
-                let small = downscale_bgra_to_rgba(&self.fitted, self.out_w, self.out_h);
+                let small = downscale_rgba_preview(&self.fitted, self.out_w, self.out_h);
                 // depth-1 channel: if the GUI hasn't drained yet, drop this
                 // frame (latest wins next tick) — never block capture.
                 let _ = ptx.try_send(small);
@@ -394,9 +410,9 @@ impl GraphicsCaptureApiHandler for Recorder {
     }
 }
 
-/// Center-crop / center-pad BGRA `src` (sw×sh) into `dst` (dw×dh).
-/// Fast path: identical size = single memcpy. Otherwise per-row memcpy.
-fn fit_bgra_center(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
+/// Center-crop / center-pad `src` (sw×sh) into `dst` (dw×dh).
+/// Pixel-order agnostic (pure memcpy). Fast path: identical size = single memcpy.
+fn fit_frame_center(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
     let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
     if sw == dw && sh == dh {
         let n = dw * dh * 4;
@@ -474,15 +490,22 @@ fn spawn_ffmpeg(cfg: &RecordConfig) -> Result<ffmpeg_sidecar::child::FfmpegChild
     };
 
     let mut cmd = ffmpeg_sidecar::command::FfmpegCommand::new();
+    // NOTE: capture delivers RGBA (ColorFormat::Rgba8) — declaring anything
+    // else (e.g. bgra) swaps red/blue and tints everything yellow.
+    // `-use_wallclock_as_timestamps`: frame timestamps come from the wall
+    // clock, so if the encoder stalls under load the video keeps real speed
+    // (slight stepping) instead of fast-forwarding.
     cmd.args([
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
+        "-use_wallclock_as_timestamps",
+        "1",
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "bgra",
+        "rgba",
         "-s",
         &format!("{}x{}", cfg.width, cfg.height),
         "-framerate",
