@@ -1,13 +1,16 @@
 [package]
-name = "lite-rec"
+name = "shockwave-screen-recorder"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight OBS-like screen/window recorder for Windows — WebM 60fps 1080p, tuned for low CPU/RAM"
+description = "Shockwave Screen Recorder — lightweight OBS-like WebM 1080p60 game recorder for Windows"
 license = "MIT"
 
 [[bin]]
-name = "lite-rec"
+name = "shockwave-rec"
 path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 windows-capture = "2"
@@ -16,6 +19,8 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 crossbeam-channel = "0.5"
 ctrlc = "2"
+eframe = "0.32"
+rfd = "0.17"
 
 [profile.release]
 opt-level = 3
