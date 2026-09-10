@@ -17,9 +17,9 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::recorder::{
-    AudioMode, Codec, Quality, RecordConfig, Snapshot, Source, Session, describe_source,
-    list_monitors, list_windows, resolve_output, resolve_size, start_session, MonitorInfo,
-    WindowInfo,
+    AudioMode, Codec, Quality, RecordConfig, Snapshot, Source, Session, auto_quality,
+    describe_source, list_monitors, list_windows, resolve_output, resolve_size, start_session,
+    MonitorInfo, WindowInfo,
 };
 
 const BITRATES: [&str; 5] = ["8M", "10M", "12M", "16M", "20M"];
@@ -132,8 +132,12 @@ impl GuiApp {
             win_sel: None,
             dir: r"D:\Recordings".to_owned(),
             filename: "gameplay.webm".to_owned(),
-            quality: Quality::Youtube,
-            bitrate_sel: 3, // 16M
+            quality: auto_quality(),
+            // match the auto preset's bitrate (Smooth -> 8M, YouTube -> 16M)
+            bitrate_sel: match auto_quality() {
+                Quality::Balanced => 0,
+                Quality::Youtube => 3,
+            },
             res_sel: 0, // native app size
             audio: AudioMode::System,
             fps60: true,

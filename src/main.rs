@@ -18,8 +18,8 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 
 use recorder::{
-    AudioMode, Codec, Quality, RecordConfig, Source, describe_source, list_monitors,
-    list_windows, resolve_output, resolve_size, start_session,
+    AudioMode, Codec, Quality, RecordConfig, Source, auto_quality, describe_source,
+    list_monitors, list_windows, resolve_output, resolve_size, start_session,
 };
 
 #[derive(Parser, Debug)]
@@ -38,9 +38,10 @@ struct Args {
     #[arg(long, default_value = r"D:\Recordings")]
     dir: String,
 
-    /// Quality preset: youtube (VP9 16M, best for uploads) or balanced (VP8 8M, low CPU)
-    #[arg(long, value_enum, default_value_t = Quality::Youtube)]
-    quality: Quality,
+    /// Quality preset: youtube (VP9 16M) or smooth/balanced (VP8 8M).
+    /// Omit it: auto-picks Smooth on ≤4-core PCs (like yours), YouTube HQ above.
+    #[arg(long, value_enum)]
+    quality: Option<Quality>,
 
     /// Override the preset codec (vp8 | vp9)
     #[arg(long, value_enum)]
@@ -108,7 +109,7 @@ impl Args {
         !self.gui
             && self.output == "gameplay.webm"
             && self.dir == r"D:\Recordings"
-            && self.quality == Quality::Youtube
+            && self.quality.is_none()
             && self.codec.is_none()
             && self.bitrate.is_none()
             && self.cpu_used.is_none()
@@ -156,9 +157,10 @@ fn main() -> Result<()> {
 
     // Harden numeric inputs (garbage in => clamped, never panic/overflow).
     let fps = args.fps.clamp(1, 120);
-    let codec = args.codec.unwrap_or_else(|| args.quality.codec());
-    let bitrate = args.bitrate.clone().unwrap_or_else(|| args.quality.bitrate().into());
-    let cpu_used = args.cpu_used.unwrap_or_else(|| args.quality.cpu_used()).clamp(0, 8);
+    let quality = args.quality.unwrap_or_else(auto_quality);
+    let codec = args.codec.unwrap_or_else(|| quality.codec());
+    let bitrate = args.bitrate.clone().unwrap_or_else(|| quality.bitrate().into());
+    let cpu_used = args.cpu_used.unwrap_or_else(|| quality.cpu_used()).clamp(0, 8);
 
     let source = match args.window.clone() {
         Some(needle) => Source::Window { needle },
@@ -194,9 +196,9 @@ fn main() -> Result<()> {
         "target    |  {width}x{height}{} @ {fps}fps  WebM({})  {} preset  bitrate {}  cpu-used {}  audio {}",
         if args.size.trim().eq_ignore_ascii_case("native") { " (native)" } else { "" },
         codec.label(),
-        match args.quality {
+        match quality {
             Quality::Youtube => "youtube",
-            Quality::Balanced => "balanced",
+            Quality::Balanced => "smooth",
         },
         bitrate,
         cpu_used,

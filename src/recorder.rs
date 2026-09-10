@@ -75,17 +75,30 @@ impl Quality {
     }
     pub fn cpu_used(self) -> u8 {
         match self {
-            // 7, not 5: on 4-thread Haswell the encoder must keep 60 fps while
-            // the game itself needs CPU. 16M bitrate preserves YT quality.
-            Quality::Youtube => 7,
+            // Max speed: on a 4-thread Haswell the encoder must hold 60 fps
+            // while the game itself needs CPU. 16M bitrate preserves quality.
+            Quality::Youtube => 8,
             Quality::Balanced => 8,
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Quality::Youtube => "YouTube HQ (VP9 16M)",
-            Quality::Balanced => "Balanced (VP8 8M, low CPU)",
+            Quality::Balanced => "Smooth 60fps (VP8 8M)",
         }
+    }
+}
+
+/// Default preset for THIS machine: 4 or fewer threads can't hold VP9-60fps
+/// next to a game, so pick Smooth (VP8); beefier machines get YouTube HQ.
+pub fn auto_quality() -> Quality {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    if n <= 4 {
+        Quality::Balanced
+    } else {
+        Quality::Youtube
     }
 }
 
@@ -567,9 +580,10 @@ fn spawn_ffmpeg(
             "2".into(),
             "-tile-rows".into(),
             "1".into(),
-            // short lookahead: less CPU + less latency, still smooth at 16M.
+            // zero lookahead: lowest CPU + lowest latency. Bits (16M) carry
+            // the quality instead — the right trade for live game capture.
             "-lag-in-frames".into(),
-            "4".into(),
+            "0".into(),
             "-auto-alt-ref".into(),
             "1".into(),
             "-g".into(),
