@@ -1,11 +1,16 @@
-//! lite-rec — lightweight OBS-like recorder for Windows.
-//! CLI (default) + modern native GUI (`--gui`).
+//! Shockwave Screen Recorder — lightweight OBS-like recorder for Windows.
+//! GUI (`--gui`, or plain double-click) + scriptable CLI.
 //! Capture: Windows Graphics Capture API. Encode: FFmpeg → WebM 1080p60.
+
+// Release builds are windowed apps: no console pops up behind the GUI.
+// (Debug builds keep the console for development. When a release build is run
+// from a terminal, stdout/stderr still go to that terminal.)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gui;
 mod recorder;
 
-use std::io::Read;
+use std::io::{IsTerminal as _, Read};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -94,10 +99,38 @@ struct Args {
     border: bool,
 }
 
+impl Args {
+    /// True when the user passed no recording options at all — i.e. a plain
+    /// double-click on the exe rather than a scripted invocation.
+    fn is_default_invocation(&self) -> bool {
+        !self.gui
+            && self.output == "gameplay.webm"
+            && self.dir == r"D:\Recordings"
+            && self.quality == Quality::Youtube
+            && self.codec.is_none()
+            && self.bitrate.is_none()
+            && self.cpu_used.is_none()
+            && self.fps == 60
+            && self.width == 1920
+            && self.height == 1080
+            && self.monitor.is_none()
+            && self.window.is_none()
+            && !self.list_windows
+            && !self.list_monitors
+            && self.threads == 4
+            && self.duration.is_none()
+            && !self.no_cursor
+            && !self.border
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.gui {
+    // Plain double-click (no console, no flags) would otherwise start a blind
+    // recording with nowhere to show status — open the GUI instead. Explicit
+    // flags always honor the CLI (scripts/automation unaffected).
+    if args.gui || (args.is_default_invocation() && !std::io::stdin().is_terminal()) {
         return gui::run();
     }
 
