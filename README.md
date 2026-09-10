@@ -28,6 +28,11 @@ to **WebM (VP8/VP9)** at **60fps 1080p**, tuned for low CPU/RAM.
 ```powershell
 cargo build --release
 
+# recordings land in D:\Recordings by default (auto-created)
+.\target\release\lite-rec.exe --output out.webm            # => D:\Recordings\out.webm
+.\target\release\lite-rec.exe --dir "D:\Videos" --output game.webm   # => D:\Videos\game.webm
+.\target\release\lite-rec.exe --output "D:\Clips\warships.webm"      # full path bypasses --dir
+
 # list targets (OBS-like picker, CLI version)
 .\target\release\lite-rec.exe --list-monitors
 .\target\release\lite-rec.exe --list-windows
@@ -60,7 +65,7 @@ Stop with **Enter** or **Ctrl+C** — the `.webm` is finalized cleanly.
 ## Flags
 
 ```
---output, --fps, --width/--height, --monitor N, --window "title..."
+--output, --dir (default D:\Recordings), --fps, --width/--height, --monitor N, --window "title..."
 --list-windows, --list-monitors, --codec vp8|vp9, --bitrate 6M
 --cpu-used 8, --threads 4, --duration N, --no-cursor, --border
 ```

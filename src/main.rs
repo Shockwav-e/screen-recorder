@@ -39,9 +39,14 @@ enum Codec {
 #[derive(Parser, Debug)]
 #[command(name = "lite-rec", version, about = "Lightweight WebM 1080p60 monitor/window recorder (OBS-like, Rust)")]
 struct Args {
-    /// Output file (must end with .webm)
+    /// Output file (must end with .webm). Bare filename => saved under --dir.
     #[arg(short, long, default_value = "out.webm")]
     output: String,
+
+    /// Folder where recordings are stored (created if missing).
+    /// Full paths in --output bypass this. Default is on your D disk.
+    #[arg(long, default_value = r"D:\Recordings")]
+    dir: String,
 
     /// Frames per second (60 = target, 30 = half CPU fallback)
     #[arg(long, default_value_t = 60)]
@@ -405,6 +410,27 @@ fn main() -> Result<()> {
     if !args.output.to_lowercase().ends_with(".webm") {
         eprintln!("NOTE: forcing .webm extension (was {})", args.output);
         args.output.push_str(".webm");
+    }
+    // Save location: bare filename => --dir (your D disk); full/absolute
+    // path in --output bypasses --dir. Parent folders are auto-created.
+    {
+        let p = std::path::Path::new(&args.output);
+        let is_bare = p.parent().map(|par| par.as_os_str().is_empty()).unwrap_or(true)
+            && !args.output.contains(':')
+            && !args.output.contains('/')
+            && !args.output.contains('\\');
+        if is_bare {
+            let dir = std::path::Path::new(&args.dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                anyhow::bail!("cannot create --dir {}: {e}", args.dir);
+            }
+            args.output = dir.join(&args.output).to_string_lossy().into_owned();
+        } else if let Some(par) = p.parent() {
+            if !par.as_os_str().is_empty() {
+                std::fs::create_dir_all(par)
+                    .with_context(|| format!("cannot create output folder {}", par.display()))?;
+            }
+        }
     }
     // VPx needs even dimensions
     args.width &= !1;
