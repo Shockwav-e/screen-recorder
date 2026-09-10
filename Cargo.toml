@@ -1,0 +1,25 @@
+[package]
+name = "lite-rec"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight OBS-like screen/window recorder for Windows — WebM 60fps 1080p, tuned for low CPU/RAM"
+license = "MIT"
+
+[[bin]]
+name = "lite-rec"
+path = "src/main.rs"
+
+[dependencies]
+windows-capture = "2"
+ffmpeg-sidecar = { version = "2", features = ["download_ffmpeg"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+crossbeam-channel = "0.5"
+ctrlc = "2"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
+panic = "unwind"
