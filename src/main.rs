@@ -18,8 +18,8 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 
 use recorder::{
-    Codec, Quality, RecordConfig, Source, describe_source, list_monitors, list_windows,
-    resolve_output, start_session,
+    AudioMode, Codec, Quality, RecordConfig, Source, describe_source, list_monitors,
+    list_windows, resolve_output, resolve_size, start_session,
 };
 
 #[derive(Parser, Debug)]
@@ -58,13 +58,15 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     fps: u32,
 
-    /// Output width (default 1920; native display is 1920 so no scaling cost)
-    #[arg(long, default_value_t = 1920)]
-    width: u32,
+    /// Output size: native (match the app/monitor — no black bars),
+    /// 1080p, 720p, or explicit WIDTHxHEIGHT (e.g. 1600x900).
+    #[arg(long, default_value = "native")]
+    size: String,
 
-    /// Output height (default 1080)
-    #[arg(long, default_value_t = 1080)]
-    height: u32,
+    /// Audio source: system (game sound), mic, both, or off.
+    /// On Win10 there is no per-app isolation — mute other apps for clean audio.
+    #[arg(long, value_enum, default_value_t = AudioMode::System)]
+    audio: AudioMode,
 
     /// Monitor index (1-based). Default: primary monitor. Ignored when --window is set.
     #[arg(long)]
@@ -111,8 +113,8 @@ impl Args {
             && self.bitrate.is_none()
             && self.cpu_used.is_none()
             && self.fps == 60
-            && self.width == 1920
-            && self.height == 1080
+            && self.size == "native"
+            && self.audio == AudioMode::System
             && self.monitor.is_none()
             && self.window.is_none()
             && !self.list_windows
@@ -153,29 +155,32 @@ fn main() -> Result<()> {
     }
 
     // Harden numeric inputs (garbage in => clamped, never panic/overflow).
-    let width = args.width.clamp(2, 7680) & !1;
-    let height = args.height.clamp(2, 4320) & !1;
     let fps = args.fps.clamp(1, 120);
     let codec = args.codec.unwrap_or_else(|| args.quality.codec());
     let bitrate = args.bitrate.clone().unwrap_or_else(|| args.quality.bitrate().into());
     let cpu_used = args.cpu_used.unwrap_or_else(|| args.quality.cpu_used()).clamp(0, 8);
 
+    let source = match args.window.clone() {
+        Some(needle) => Source::Window { needle },
+        None => Source::Monitor { index: args.monitor },
+    };
+    // Native size = the app's own size: no black bars, fastest path.
+    let (width, height) = resolve_size(&args.size, &source)
+        .with_context(|| "bad --size / source — try --list-windows")?;
     let output = resolve_output(&args.output, &args.dir)?;
     let cfg = RecordConfig {
         output,
         fps,
         width,
         height,
-        source: match args.window.clone() {
-            Some(needle) => Source::Window { needle },
-            None => Source::Monitor { index: args.monitor },
-        },
+        source,
         codec,
         bitrate: bitrate.clone(),
         cpu_used,
         threads: args.threads,
         duration: args.duration,
         no_cursor: args.no_cursor,
+        audio: args.audio,
     };
     if args.border {
         eprintln!("NOTE: --border needs Windows 11 and is ignored on Windows 10.");
@@ -186,7 +191,8 @@ fn main() -> Result<()> {
 
     println!("shockwave  |  {src_desc}");
     println!(
-        "target    |  {width}x{height} @ {fps}fps  WebM({})  {} preset  bitrate {}  cpu-used {}",
+        "target    |  {width}x{height}{} @ {fps}fps  WebM({})  {} preset  bitrate {}  cpu-used {}  audio {}",
+        if args.size.trim().eq_ignore_ascii_case("native") { " (native)" } else { "" },
         codec.label(),
         match args.quality {
             Quality::Youtube => "youtube",
@@ -194,6 +200,7 @@ fn main() -> Result<()> {
         },
         bitrate,
         cpu_used,
+        args.audio.label(),
     );
     if codec == Codec::Vp9 {
         println!("note      |  VP9 on 4-thread Haswell ~= 35-55% CPU; --quality balanced for ~15-25%.");

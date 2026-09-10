@@ -7,6 +7,8 @@
 //!   - bounded 2-frame channel + try_send (never blocks capture; drops = realtime)
 //!   - buffer reuse (no per-frame alloc), CFR pacer thread, realtime libvpx flags
 
+use std::io::Write as _;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -15,9 +17,10 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::ValueEnum;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -72,7 +75,9 @@ impl Quality {
     }
     pub fn cpu_used(self) -> u8 {
         match self {
-            Quality::Youtube => 5,
+            // 7, not 5: on 4-thread Haswell the encoder must keep 60 fps while
+            // the game itself needs CPU. 16M bitrate preserves YT quality.
+            Quality::Youtube => 7,
             Quality::Balanced => 8,
         }
     }
@@ -104,6 +109,39 @@ pub struct RecordConfig {
     pub threads: u32,
     pub duration: Option<u64>,
     pub no_cursor: bool,
+    pub audio: AudioMode,
+}
+
+/// Audio source. Note: per-app isolation needs Windows 11+; on Windows 10
+/// "System" hears everything playing — mute other apps for clean game audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum AudioMode {
+    /// Everything you hear (game + all apps). Best for game videos.
+    #[default]
+    System,
+    /// Microphone only (commentary).
+    Mic,
+    /// Game sound + microphone mixed together.
+    Both,
+    /// Silent video.
+    Off,
+}
+
+impl AudioMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioMode::System => "System (game sound)",
+            AudioMode::Mic => "Microphone",
+            AudioMode::Both => "System + mic",
+            AudioMode::Off => "Off",
+        }
+    }
+    fn system(self) -> bool {
+        matches!(self, AudioMode::System | AudioMode::Both)
+    }
+    fn mic(self) -> bool {
+        matches!(self, AudioMode::Mic | AudioMode::Both)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +202,58 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
             hz: m.refresh_rate().unwrap_or(0),
         })
         .collect())
+}
+
+fn source_native_size(source: &Source) -> Result<(u32, u32)> {
+    match source {
+        Source::Window { needle } => {
+            let w = Window::from_contains_name(needle)
+                .with_context(|| format!("no window title contains \"{needle}\""))?;
+            Ok((
+                w.width().unwrap_or(0).max(0) as u32,
+                w.height().unwrap_or(0).max(0) as u32,
+            ))
+        }
+        Source::Monitor { index } => {
+            let m = match index {
+                Some(i) => Monitor::from_index((*i).max(1))?,
+                None => Monitor::primary()?,
+            };
+            Ok((m.width().unwrap_or(0), m.height().unwrap_or(0)))
+        }
+    }
+}
+
+/// Output frame size.
+/// Native (default): match the app/monitor at record start — no black bars,
+/// and the identical-size fast path (single memcpy). Fixed modes pad/crop.
+pub fn resolve_size(size: &str, source: &Source) -> Result<(u32, u32)> {
+    fn even(v: u32) -> u32 {
+        v.clamp(64, 7680) & !1 // VPx needs even dimensions
+    }
+    match size.trim().to_lowercase().as_str() {
+        "native" | "auto" | "" => {
+            let (w, h) = source_native_size(source)?;
+            if w < 16 || h < 16 {
+                anyhow::bail!("source has no size (window minimized?)");
+            }
+            Ok((even(w), even(h)))
+        }
+        "1080p" => Ok((1920, 1080)),
+        "720p" => Ok((1280, 720)),
+        custom => {
+            if let Some((a, b)) = custom.split_once('x') {
+                if let (Ok(w), Ok(h)) =
+                    (a.trim().parse::<u32>(), b.trim().parse::<u32>())
+                {
+                    if w >= 64 && h >= 64 {
+                        return Ok((even(w), even(h)));
+                    }
+                }
+            }
+            anyhow::bail!("bad size \"{size}\": use native, 1080p, 720p, or WIDTHxHEIGHT")
+        }
+    }
 }
 
 pub fn describe_source(cfg: &RecordConfig) -> Result<String> {
@@ -438,7 +528,12 @@ fn fit_frame_center(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u
 
 // ---------- ffmpeg ----------
 
-fn spawn_ffmpeg(cfg: &RecordConfig) -> Result<ffmpeg_sidecar::child::FfmpegChild> {
+/// Spawn ffmpeg. `audio` is Some((sample_rate, tcp_port)) unless Off —
+/// video comes over stdin, audio over loopback TCP, muxed to one WebM.
+fn spawn_ffmpeg(
+    cfg: &RecordConfig,
+    audio: Option<(u32, u16)>,
+) -> Result<ffmpeg_sidecar::child::FfmpegChild> {
     let _ = ffmpeg_sidecar::download::auto_download().context("ffmpeg auto-download failed");
 
     let enc: &str = match cfg.codec {
@@ -472,8 +567,9 @@ fn spawn_ffmpeg(cfg: &RecordConfig) -> Result<ffmpeg_sidecar::child::FfmpegChild
             "2".into(),
             "-tile-rows".into(),
             "1".into(),
+            // short lookahead: less CPU + less latency, still smooth at 16M.
             "-lag-in-frames".into(),
-            "16".into(),
+            "4".into(),
             "-auto-alt-ref".into(),
             "1".into(),
             "-g".into(),
@@ -512,7 +608,23 @@ fn spawn_ffmpeg(cfg: &RecordConfig) -> Result<ffmpeg_sidecar::child::FfmpegChild
         &cfg.fps.to_string(),
         "-i",
         "-",
-        "-an",
+    ]);
+    if let Some((rate, port)) = audio {
+        // Game/mic sound: raw PCM over loopback TCP -> Opus in the same WebM.
+        cmd.args([
+            "-f",
+            "s16le",
+            "-ar",
+            &rate.to_string(),
+            "-ac",
+            "2",
+            "-i",
+            &format!("tcp://127.0.0.1:{port}"),
+        ]);
+    } else {
+        cmd.arg("-an");
+    }
+    cmd.args([
         "-c:v",
         enc,
         "-b:v",
@@ -522,6 +634,20 @@ fn spawn_ffmpeg(cfg: &RecordConfig) -> Result<ffmpeg_sidecar::child::FfmpegChild
         "-pix_fmt",
         "yuv420p",
     ]);
+    if audio.is_some() {
+        cmd.args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "128k",
+            "-ar",
+            "48000",
+        ]);
+    }
     for e in &extra {
         cmd.arg(e);
     }
@@ -597,6 +723,247 @@ fn writer_loop(
     }
 }
 
+// ---------- audio (system loopback + mic -> Opus) ----------
+
+/// Native sample rate for the audio feed. Loopback rate wins (Both/System),
+/// otherwise the mic rate — ffmpeg resamples to 48 kHz for Opus.
+fn probe_audio_rate(mode: AudioMode) -> Result<u32> {
+    let host = cpal::default_host();
+    if mode.system() {
+        let dev = host
+            .default_output_device()
+            .context("no system audio device (speakers/headphones?)")?;
+        let c = dev.default_output_config().context("no system audio format")?;
+        match c.sample_format() {
+            cpal::SampleFormat::F32
+            | cpal::SampleFormat::I16
+            | cpal::SampleFormat::U16 => Ok(c.sample_rate().0),
+            f => bail!("unsupported system audio format ({f:?})"),
+        }
+    } else {
+        let dev = host.default_input_device().context("no microphone found")?;
+        let c = dev.default_input_config().context("no microphone format")?;
+        match c.sample_format() {
+            cpal::SampleFormat::F32
+            | cpal::SampleFormat::I16
+            | cpal::SampleFormat::U16 => Ok(c.sample_rate().0),
+            f => bail!("unsupported microphone format ({f:?})"),
+        }
+    }
+}
+
+fn to_stereo(samples: &[f32], channels: usize) -> Vec<f32> {
+    let ch = channels.max(1);
+    let n = samples.len() / ch;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let l = samples[i * ch];
+        out.push(l);
+        out.push(if ch > 1 { samples[i * ch + 1] } else { l });
+    }
+    out
+}
+
+/// Open an input stream on `dev` (an output device = loopback capture,
+/// an input device = mic) and forward stereo-f32 chunks to `tx`.
+fn build_in_stream(
+    dev: &cpal::Device,
+    sc: &cpal::SupportedStreamConfig,
+    tx: Sender<Vec<f32>>,
+    what: &'static str,
+) -> Result<cpal::Stream> {
+    let ch = sc.channels() as usize;
+    let cfg: cpal::StreamConfig = sc.config();
+    let err_fn = move |e| eprintln!("audio {what} stream error: {e}");
+    let stream = match sc.sample_format() {
+        cpal::SampleFormat::F32 => dev.build_input_stream(
+            &cfg,
+            move |d: &[f32], _| {
+                let _ = tx.try_send(to_stereo(d, ch));
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::I16 => dev.build_input_stream(
+            &cfg,
+            move |d: &[i16], _| {
+                let _ = tx.try_send(to_stereo(
+                    &d.iter().map(|&s| s as f32 / 32768.0).collect::<Vec<_>>(),
+                    ch,
+                ));
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::U16 => dev.build_input_stream(
+            &cfg,
+            move |d: &[u16], _| {
+                let _ = tx.try_send(to_stereo(
+                    &d.iter().map(|&s| s as f32 / 32768.0 - 1.0).collect::<Vec<_>>(),
+                    ch,
+                ));
+            },
+            err_fn,
+            None,
+        ),
+        f => bail!("unsupported {what} audio format ({f:?})"),
+    }
+    .with_context(|| format!("couldn't open {what} audio"))?;
+    stream.play().context("couldn't start audio")?;
+    Ok(stream)
+}
+
+fn write_s16(tcp: &mut TcpStream, stereo_f32: &[f32]) -> Result<()> {
+    let mut buf = Vec::with_capacity(stereo_f32.len() * 2);
+    for &v in stereo_f32 {
+        buf.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    tcp.write_all(&buf).context("ffmpeg audio link broke")?;
+    Ok(())
+}
+
+/// Mix one loopback chunk with resampled mic backlog (linear interpolation).
+/// Returns stereo f32 at the loopback rate. Underruns pad with the last
+/// sample instead of stalling — audio never blocks the recording.
+fn mix_with_mic(
+    lchunk: &[f32],
+    backlog: &mut Vec<f32>,
+    pos: &mut f32,
+    mic_rate: u32,
+    out_rate: u32,
+    n: usize,
+) -> Vec<f32> {
+    fn at(backlog: &[f32], k: usize) -> (f32, f32) {
+        if backlog.len() < 2 {
+            return (0.0, 0.0);
+        }
+        let k = k.min(backlog.len() / 2 - 1);
+        (backlog[k * 2], backlog[k * 2 + 1])
+    }
+    let mut out = Vec::with_capacity(n * 2);
+    let ratio = mic_rate as f32 / out_rate.max(1) as f32;
+    for i in 0..n {
+        let p = *pos + i as f32 * ratio;
+        let i0 = p.floor() as usize;
+        let frac = (p - i0 as f32).clamp(0.0, 1.0);
+        let (al, ar) = at(backlog, i0);
+        let (bl, br) = at(backlog, i0 + 1);
+        out.push(lchunk[i * 2] + al + (bl - al) * frac);
+        out.push(lchunk[i * 2 + 1] + ar + (br - ar) * frac);
+    }
+    *pos += n as f32 * ratio;
+    let drop = (*pos).floor().max(0.0) as usize;
+    let drop = drop.min(backlog.len() / 2);
+    backlog.drain(..drop * 2);
+    *pos -= drop as f32;
+    // Bound memory if the mic floods (same clock domain — shouldn't happen).
+    const MAX_BACKLOG: usize = 48000 * 2 * 5;
+    if backlog.len() > MAX_BACKLOG {
+        let excess = backlog.len() - MAX_BACKLOG;
+        backlog.drain(..excess);
+    }
+    out
+}
+
+/// Audio thread: owns the cpal streams, mixes, and feeds s16le stereo to
+/// ffmpeg over loopback TCP. Accepts the connection FIRST so that even a
+/// later capture failure closes the link instead of hanging ffmpeg.
+fn audio_loop(
+    listener: TcpListener,
+    rate: u32,
+    mode: AudioMode,
+    mic_rate_hint: u32,
+    stop: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+) {
+    let res: Result<()> = (|| {
+        let (mut tcp, _) = listener.accept().context("ffmpeg audio link failed")?;
+        tcp.set_nodelay(true).ok();
+
+        let host = cpal::default_host();
+        let (loop_tx, loop_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
+        let (mic_tx, mic_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
+        // Streams stay alive exactly as long as this thread (drop = stop).
+        let mut _streams: Vec<cpal::Stream> = Vec::new();
+        let mut mic_rate = mic_rate_hint;
+        if mode.system() {
+            let dev = host.default_output_device().context("system audio lost")?;
+            let sc = dev.default_output_config()?;
+            _streams.push(build_in_stream(&dev, &sc, loop_tx, "system")?);
+        }
+        if mode.mic() {
+            let dev = host.default_input_device().context("microphone lost")?;
+            let sc = dev.default_input_config()?;
+            mic_rate = sc.sample_rate().0;
+            _streams.push(build_in_stream(&dev, &sc, mic_tx, "mic")?);
+        }
+
+        let idle = Duration::from_millis(2);
+        let drained = || {
+            stop.load(Ordering::Relaxed) && loop_rx.is_empty() && mic_rx.is_empty()
+        };
+        match mode {
+            AudioMode::System => loop {
+                match loop_rx.try_recv() {
+                    Ok(chunk) => write_s16(&mut tcp, &chunk)?,
+                    Err(TryRecvError::Empty) => {
+                        if drained() {
+                            break;
+                        }
+                        std::thread::sleep(idle);
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            },
+            AudioMode::Mic => loop {
+                match mic_rx.try_recv() {
+                    Ok(chunk) => write_s16(&mut tcp, &chunk)?,
+                    Err(TryRecvError::Empty) => {
+                        if drained() {
+                            break;
+                        }
+                        std::thread::sleep(idle);
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            },
+            AudioMode::Both => {
+                let mut backlog: Vec<f32> = Vec::new();
+                let mut pos = 0f32;
+                loop {
+                    while let Ok(m) = mic_rx.try_recv() {
+                        backlog.extend_from_slice(&m);
+                    }
+                    match loop_rx.try_recv() {
+                        Ok(lchunk) => {
+                            let n = lchunk.len() / 2;
+                            if n == 0 {
+                                continue;
+                            }
+                            let mixed =
+                                mix_with_mic(&lchunk, &mut backlog, &mut pos, mic_rate, rate, n);
+                            write_s16(&mut tcp, &mixed)?;
+                        }
+                        Err(TryRecvError::Empty) => {
+                            if drained() {
+                                break;
+                            }
+                            std::thread::sleep(idle);
+                        }
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+            AudioMode::Off => {}
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        *lock_err(&error) = Some(format!("audio: {e:?}"));
+    }
+    // TCP + streams drop here -> audio EOF for ffmpeg.
+}
+
 // ---------- session (shared by CLI + GUI) ----------
 
 #[derive(Debug, Clone, Default)]
@@ -618,6 +985,7 @@ pub struct Session {
     started: Instant,
     capture: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+    audio: Option<JoinHandle<()>>,
     preview_rx: Option<Receiver<PreviewFrame>>,
 }
 
@@ -638,7 +1006,53 @@ pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let deadline = cfg.duration.map(|s| Instant::now() + Duration::from_secs(s));
 
-    let child = spawn_ffmpeg(&cfg)?;
+    // Audio link: probe devices first (fail fast with a clear message),
+    // then bind loopback TCP so ffmpeg gets a stable port. Binding before
+    // the spawn guarantees no race; the audio thread accepts first thing so
+    // even a later capture failure closes the link instead of hanging ffmpeg.
+    enum AudioLink {
+        Off,
+        On { listener: TcpListener, rate: u32, mic_rate: u32, port: u16 },
+    }
+    let audio_link = if cfg.audio == AudioMode::Off {
+        AudioLink::Off
+    } else {
+        let rate = probe_audio_rate(cfg.audio)?;
+        let mic_rate = if cfg.audio.mic() {
+            cpal::default_host()
+                .default_input_device()
+                .and_then(|d| d.default_input_config().ok())
+                .map(|c| c.sample_rate().0)
+                .unwrap_or(rate)
+        } else {
+            rate
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").context("couldn't open audio link")?;
+        let port = listener
+            .local_addr()
+            .context("couldn't read audio link port")?
+            .port();
+        AudioLink::On { listener, rate, mic_rate, port }
+    };
+
+    let child = spawn_ffmpeg(
+        &cfg,
+        match &audio_link {
+            AudioLink::Off => None,
+            AudioLink::On { rate, port, .. } => Some((*rate, *port)),
+        },
+    )?;
+
+    // audio thread owns the cpal streams + TCP socket
+    let audio = match audio_link {
+        AudioLink::Off => None,
+        AudioLink::On { listener, rate, mic_rate, .. } => {
+            let (stop, error, mode) = (stop.clone(), error.clone(), cfg.audio);
+            Some(std::thread::spawn(move || {
+                audio_loop(listener, rate, mode, mic_rate, stop, error)
+            }))
+        }
+    };
 
     // writer thread owns ffmpeg
     let writer = {
@@ -722,6 +1136,7 @@ pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
         started: Instant::now(),
         capture: Some(capture),
         writer: Some(writer),
+        audio,
         preview_rx: prx,
     })
 }
@@ -750,11 +1165,12 @@ impl Session {
             written: self.written.load(Ordering::Relaxed),
         }
     }
-    /// True once both background threads have exited (joinable without blocking).
+    /// True once all background threads have exited (joinable without blocking).
     pub fn captures_done(&self) -> bool {
         let cap = self.capture.as_ref().map(|h| h.is_finished()).unwrap_or(true);
         let wr = self.writer.as_ref().map(|h| h.is_finished()).unwrap_or(true);
-        cap && wr
+        let au = self.audio.as_ref().map(|h| h.is_finished()).unwrap_or(true);
+        cap && wr && au
     }
     /// Finalize the .webm and return any background error. Call after
     /// `request_stop()` or once `captures_done()` (duration reached / window
@@ -762,6 +1178,11 @@ impl Session {
     pub fn wait(mut self) -> Result<Snapshot> {
         self.request_stop();
         if let Some(h) = self.capture.take() {
+            let _ = h.join();
+        }
+        // Audio next: closing the TCP link ends the audio stream, then the
+        // writer closes video stdin and ffmpeg finalizes the file.
+        if let Some(h) = self.audio.take() {
             let _ = h.join();
         }
         if let Some(h) = self.writer.take() {

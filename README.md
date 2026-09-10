@@ -17,11 +17,25 @@ cargo build --release
 ```
 
 The GUI has a **live preview** (480p, 10 fps tap — what you see is what's
-saved), an **app picker** (monitor dropdown, or filterable window list with a
-green "Will record" confirmation), save-folder browser, quality presets, and
-live stats (fps, captured, dropped). Finished videos appear in a
-**recordings library** with Play / Delete / Open-folder actions.
+saved), an **app picker dropdown** (monitor, or filterable window list with a
+green "Will record" confirmation — the recorder hides itself), audio + size
+dropdowns, save-folder browser, quality presets, and live stats (fps,
+captured, dropped). Finished videos appear in a **recordings library** with
+Play / Delete / Open-folder actions.
 It repaints at ~10 Hz while recording and idles at ~0% CPU otherwise.
+
+## Size: native app resolution, no black bars
+
+`--size native` (default) records at the source's own size — a 1440×759
+Notepad window saves as 1440×758, not stretched/padded to 1080p. Use
+`--size 1080p`, `720p`, or `WIDTHxHEIGHT` to force a frame (center crop/pad).
+
+## Audio: game sound + mic (Opus in the same WebM)
+
+`--audio system` (default) captures everything you hear via WASAPI loopback,
+`mic` captures the microphone, `both` mixes them, `off` is silent.
+Note: per-app-only audio needs Windows 11+ — on Windows 10, mute other apps
+(browser, music) while recording a game window for clean audio.
 
 ## Your machine vs requirements
 

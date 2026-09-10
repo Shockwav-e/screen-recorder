@@ -17,11 +17,14 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::recorder::{
-    Codec, Quality, RecordConfig, Snapshot, Source, Session, describe_source, list_monitors,
-    list_windows, resolve_output, start_session, MonitorInfo, WindowInfo,
+    AudioMode, Codec, Quality, RecordConfig, Snapshot, Source, Session, describe_source,
+    list_monitors, list_windows, resolve_output, resolve_size, start_session, MonitorInfo,
+    WindowInfo,
 };
 
 const BITRATES: [&str; 5] = ["8M", "10M", "12M", "16M", "20M"];
+const RES_OPTIONS: [&str; 3] = ["native", "1080p", "720p"];
+const RES_LABELS: [&str; 3] = ["Native (app size, no bars)", "1080p fixed", "720p fixed"];
 
 #[derive(PartialEq)]
 enum Phase {
@@ -79,6 +82,8 @@ pub struct GuiApp {
     filename: String,
     quality: Quality,
     bitrate_sel: usize,
+    res_sel: usize,
+    audio: AudioMode,
     fps60: bool,
     no_cursor: bool,
     auto_stop: bool,
@@ -129,6 +134,8 @@ impl GuiApp {
             filename: "gameplay.webm".to_owned(),
             quality: Quality::Youtube,
             bitrate_sel: 3, // 16M
+            res_sel: 0, // native app size
+            audio: AudioMode::System,
             fps60: true,
             no_cursor: false,
             auto_stop: false,
@@ -235,11 +242,19 @@ impl GuiApp {
         };
 
         let codec: Codec = self.quality.codec();
+        let size_mode = RES_OPTIONS[self.res_sel.min(RES_OPTIONS.len() - 1)];
+        let (width, height) = match resolve_size(size_mode, &source) {
+            Ok(wh) => wh,
+            Err(e) => {
+                self.error_msg = Some(format!("bad size/source: {e:?}"));
+                return;
+            }
+        };
         let cfg = RecordConfig {
             output,
             fps: if self.fps60 { 60 } else { 30 },
-            width: 1920,
-            height: 1080,
+            width,
+            height,
             source,
             codec,
             bitrate: self.selected_bitrate(),
@@ -247,6 +262,7 @@ impl GuiApp {
             threads: 4,
             duration: self.auto_stop.then_some(self.stop_secs.max(5) as u64),
             no_cursor: self.no_cursor,
+            audio: self.audio,
         };
         // Validate the source exists before claiming "recording".
         if let Err(e) = describe_source(&cfg) {
@@ -392,7 +408,7 @@ impl eframe::App for GuiApp {
                         );
                     });
                     let avail = ui.available_width();
-                    let h = (avail * 9.0 / 16.0).clamp(120.0, 400.0);
+                    let h = (avail * 9.0 / 16.0).clamp(90.0, 240.0);
                     if self.show_preview {
                         if let Some(tex) = &self.preview_tex {
                             ui.add(
@@ -468,41 +484,50 @@ impl eframe::App for GuiApp {
                             });
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label("Filter:");
+                            ui.label("App:");
+                            let filt = self.win_filter.to_lowercase();
+                            let items: Vec<(usize, String, String)> = self
+                                .windows
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, w)| {
+                                    filt.is_empty()
+                                        || w.title.to_lowercase().contains(&filt)
+                                        || w.process.to_lowercase().contains(&filt)
+                                })
+                                .map(|(i, w)| {
+                                    let t: String =
+                                        w.title.chars().take(38).collect();
+                                    (i, t, w.process.clone())
+                                })
+                                .collect();
+                            let label = self
+                                .win_sel
+                                .and_then(|i| self.windows.get(i))
+                                .map(|w| {
+                                    w.title.chars().take(38).collect::<String>()
+                                })
+                                .unwrap_or_else(|| "pick an app…".to_owned());
+                            let mut picked = self.win_sel;
+                            egui::ComboBox::from_id_salt("win")
+                                .selected_text(label)
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for (i, t, p) in &items {
+                                        ui.selectable_value(
+                                            &mut picked,
+                                            Some(*i),
+                                            format!("{t}  ({p})"),
+                                        );
+                                    }
+                                });
+                            self.win_sel = picked;
                             ui.add_enabled(
                                 !recording,
                                 egui::TextEdit::singleline(&mut self.win_filter)
-                                    .hint_text("e.g. Warships")
-                                    .desired_width(220.0),
+                                    .hint_text("filter")
+                                    .desired_width(80.0),
                             );
-                        });
-                        let filt = self.win_filter.to_lowercase();
-                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                            let mut picked = None;
-                            for (i, w) in self.windows.iter().enumerate() {
-                                if !filt.is_empty()
-                                    && !w.title.to_lowercase().contains(&filt)
-                                    && !w.process.to_lowercase().contains(&filt)
-                                {
-                                    continue;
-                                }
-                                let label = format!("{}  [{}x{}] ({})", w.title, w.w, w.h, w.process);
-                                if ui
-                                    .add_enabled(
-                                        !recording,
-                                        egui::Button::selectable(
-                                            self.win_sel == Some(i),
-                                            label,
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    picked = Some(i);
-                                }
-                            }
-                            if let Some(i) = picked {
-                                self.win_sel = Some(i);
-                            }
                         });
                     }
                     if self.use_window {
@@ -584,6 +609,44 @@ impl eframe::App for GuiApp {
                         });
                     });
                     ui.horizontal(|ui| {
+                        ui.label("Audio:");
+                        egui::ComboBox::from_id_salt("aud")
+                            .selected_text(self.audio.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.audio,
+                                    AudioMode::System,
+                                    AudioMode::System.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.audio,
+                                    AudioMode::Mic,
+                                    AudioMode::Mic.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.audio,
+                                    AudioMode::Both,
+                                    AudioMode::Both.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.audio,
+                                    AudioMode::Off,
+                                    AudioMode::Off.label(),
+                                );
+                            });
+                        ui.label("Size:");
+                        egui::ComboBox::from_id_salt("res")
+                            .selected_text(
+                                RES_LABELS[self.res_sel.min(RES_LABELS.len() - 1)],
+                            )
+                            .show_ui(ui, |ui| {
+                                for (i, l) in RES_LABELS.iter().enumerate() {
+                                    ui.selectable_value(&mut self.res_sel, i, *l);
+                                }
+                            });
+                    });
+                    ui.weak("Win10 has no per-app audio — mute other apps for clean game sound.");
+                    ui.horizontal(|ui| {
                         ui.add_enabled(
                             !recording,
                             egui::Checkbox::new(&mut self.no_cursor, "Hide cursor"),
@@ -606,19 +669,19 @@ impl eframe::App for GuiApp {
                     match self.phase {
                         Phase::Idle => {
                             let btn = egui::Button::new(
-                                egui::RichText::new("●  Record").size(20.0).strong(),
+                                egui::RichText::new("●  Record").size(17.0).strong(),
                             )
                             .fill(egui::Color32::from_rgb(200, 40, 40))
-                            .min_size(egui::vec2(220.0, 44.0));
+                            .min_size(egui::vec2(180.0, 38.0));
                             if ui.add(btn).clicked() {
                                 self.start();
                             }
                         }
                         Phase::Recording => {
                             let btn = egui::Button::new(
-                                egui::RichText::new("■  Stop").size(20.0).strong(),
+                                egui::RichText::new("■  Stop").size(17.0).strong(),
                             )
-                            .min_size(egui::vec2(220.0, 44.0));
+                            .min_size(egui::vec2(180.0, 38.0));
                             if ui.add(btn).clicked() {
                                 self.begin_stop();
                             }
@@ -678,7 +741,7 @@ impl eframe::App for GuiApp {
                     } else {
                         let mut play_path: Option<String> = None;
                         let mut del_idx: Option<usize> = None;
-                        egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(96.0).show(ui, |ui| {
                             for (i, f) in self.lib_files.iter().enumerate() {
                                 ui.horizontal(|ui| {
                                     let mut nm = f.name.clone();
@@ -747,8 +810,8 @@ pub fn run() -> Result<()> {
             .expect("assets/icon-256.png is corrupt");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 980.0])
-            .with_min_inner_size([600.0, 700.0])
+            .with_inner_size([680.0, 800.0])
+            .with_min_inner_size([560.0, 620.0])
             .with_icon(icon),
         ..Default::default()
     };
