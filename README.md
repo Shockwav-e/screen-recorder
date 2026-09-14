@@ -1,4 +1,4 @@
-# Shockwave Screen Recorder — lightweight Rust game recorder (WebM 1080p60)
+# Crabby — lightweight Rust game recorder (1080p60)
 
 OBS-like capture for Windows, built in Rust. Records **monitor or specific window**
 to **WebM (VP8/VP9)** at **60fps 1080p**. Ships with a **modern native GUI**
@@ -10,10 +10,10 @@ and a scriptable **CLI**, tuned for low CPU/RAM and YouTube-ready quality.
 cargo build --release
 
 # modern interface (recommended)
-.\target\release\shockwave-rec.exe --gui
+.\target\release\crabby.exe --gui
 
 # headless / scripted
-.\target\release\shockwave-rec.exe --quality youtube --output gameplay.webm
+.\target\release\crabby.exe --quality youtube --output gameplay.webm
 ```
 
 The GUI has a **live preview** (480p, 10 fps tap — what you see is what's
@@ -23,6 +23,24 @@ dropdowns, save-folder browser, quality presets, and live stats (fps,
 captured, dropped). Finished videos appear in a **recordings library** with
 Play / Delete / Open-folder actions.
 It repaints at ~10 Hz while recording and idles at ~0% CPU otherwise.
+
+## Updates — no reinstall needed
+
+Crabby checks GitHub Releases for a newer version once a day in the
+background (plus a "Check for updates" button in the header showing the
+current version). When one drops you get an **Update available** badge with
+the release notes — one click downloads it and restarts straight into the
+new version. CLI works too:
+
+```powershell
+crabby --check-updates
+crabby --update
+```
+
+Maintainer (publishing): bump `version` in `Cargo.toml`, commit, then
+`git tag v1.1.0` + `git push --tags`. The release workflow builds
+`crabby.exe` and attaches it to the GitHub Release — installed copies pick
+it up on their next check.
 
 ## Size: native app resolution, no black bars
 
@@ -65,8 +83,8 @@ Note: per-app-only audio needs Windows 11+ — on Windows 10, mute other apps
 - Run the game in **borderless windowed** mode if fullscreen capture is black
   (WGC can't see exclusive fullscreen — same limit as OBS display capture).
 - Window-only (clean, like OBS Game Capture):
-  `shockwave-rec --window "Modern Warships" --quality youtube`
-- Whole screen: `shockwave-rec --monitor 1 --quality youtube`
+  `crabby --window "Modern Warships" --quality youtube`
+- Whole screen: `crabby --monitor 1 --quality youtube`
 - 10-second test: `--window "Modern Warships" --duration 10 --output test.webm`
 
 ## Usage
@@ -74,18 +92,18 @@ Note: per-app-only audio needs Windows 11+ — on Windows 10, mute other apps
 ```powershell
 # recordings land in D:\Recordings by default (auto-created, never overwritten —
 # existing names get _001, _002…)
-shockwave-rec --output gameplay.webm             # => D:\Recordings\gameplay.webm
-shockwave-rec --dir "D:\Videos" --output game.webm
-shockwave-rec --output "D:\Clips\warships.webm"  # full path bypasses --dir
+crabby --output gameplay.webm             # => D:\Recordings\gameplay.webm
+crabby --dir "D:\Videos" --output game.webm
+crabby --output "D:\Clips\warships.webm"  # full path bypasses --dir
 
 # list targets
-shockwave-rec --list-monitors
-shockwave-rec --list-windows
+crabby --list-monitors
+crabby --list-windows
 
 # overrides / fallbacks
-shockwave-rec --codec vp8 --bitrate 10M --output light.webm
-shockwave-rec --fps 30 --output light30.webm
-shockwave-rec --no-cursor --output clean.webm
+crabby --codec vp8 --bitrate 10M --output light.webm
+crabby --fps 30 --output light30.webm
+crabby --no-cursor --output clean.webm
 ```
 
 Stop with **Enter** or **Ctrl+C** — the `.webm` is finalized cleanly.
@@ -103,7 +121,8 @@ Stop with **Enter** or **Ctrl+C** — the `.webm` is finalized cleanly.
 
 ## Branding
 
-`assets/Shockwave.png` is the master logo. `assets/icon-{16,32,48,64,256}.png`
-are generated sizes; `build.rs` packs them into a multi-image `icon.ico` at
-build time and embeds it in the exe (taskbar, Alt-Tab, shortcuts), while the
+`assets/crabby.png` is the master logo. `assets/icon-<N>.png`
+are high-quality sizes regenerated from it; `build.rs` packs them into a
+multi-image `icon.ico` at build time and embeds it in the exe (taskbar,
+Alt-Tab, shortcuts) with version info + a DPI-aware manifest, while the
 GUI sets the same art as its window icon at runtime.

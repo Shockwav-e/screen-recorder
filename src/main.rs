@@ -1,4 +1,4 @@
-//! Shockwave Screen Recorder — lightweight OBS-like recorder for Windows.
+//! Crabby — lightweight OBS-like recorder for Windows.
 //! GUI (`--gui`, or plain double-click) + scriptable CLI.
 //! Capture: Windows Graphics Capture API. Encode: FFmpeg → WebM 1080p60.
 
@@ -9,6 +9,7 @@
 
 mod gui;
 mod recorder;
+mod updater;
 
 use std::io::{IsTerminal as _, Read};
 use std::sync::atomic::Ordering;
@@ -24,7 +25,7 @@ use recorder::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "shockwave-rec", version, about = "Shockwave Screen Recorder — lightweight WebM 1080p60 monitor/window recorder (OBS-like, Rust)")]
+#[command(name = "crabby", version, about = "Crabby — lightweight 1080p60 monitor/window recorder (OBS-like, Rust)")]
 struct Args {
     /// Launch the modern graphical interface instead of the CLI
     #[arg(long, default_value_t = false)]
@@ -101,6 +102,18 @@ struct Args {
     /// Draw the yellow OBS-style border around captured window (default off)
     #[arg(long, default_value_t = false)]
     border: bool,
+
+    /// Check GitHub for a newer Crabby release and exit (no recording)
+    #[arg(long, default_value_t = false)]
+    check_updates: bool,
+
+    /// Download + install the newest Crabby release, then restart (no recording)
+    #[arg(long, default_value_t = false)]
+    update: bool,
+
+    /// Internal: passed by the updater on restart after a successful update
+    #[arg(long, hide = true)]
+    updated_from: Option<String>,
 }
 
 impl Args {
@@ -125,6 +138,9 @@ impl Args {
             && self.duration.is_none()
             && !self.no_cursor
             && !self.border
+            && !self.check_updates
+            && !self.update
+            && self.updated_from.is_none()
     }
 }
 
@@ -134,8 +150,15 @@ fn main() -> Result<()> {
     // Plain double-click (no console, no flags) would otherwise start a blind
     // recording with nowhere to show status — open the GUI instead. Explicit
     // flags always honor the CLI (scripts/automation unaffected).
-    if args.gui || (args.is_default_invocation() && !std::io::stdin().is_terminal()) {
-        return gui::run();
+    if args.gui || args.updated_from.is_some() || (args.is_default_invocation() && !std::io::stdin().is_terminal()) {
+        return gui::run(args.updated_from);
+    }
+
+    if args.check_updates {
+        return check_updates_cli();
+    }
+    if args.update {
+        return update_cli();
     }
 
     if args.list_windows {
@@ -200,7 +223,7 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
-    println!("shockwave  |  {src_desc}");
+    println!("crabby     |  {src_desc}");
     println!(
         "target    |  {width}x{height}{} @ {fps}fps  {}({})  {} preset  bitrate {}  cpu-used {}  audio {}",
         if args.size.trim().eq_ignore_ascii_case("native") { " (native)" } else { "" },
@@ -267,4 +290,39 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--check-updates`: print whether a newer release exists.
+fn check_updates_cli() -> Result<()> {
+    println!("crabby v{} — checking for updates…", updater::current_version());
+    match updater::check_for_update()? {
+        None => println!("up to date ✓"),
+        Some(rel) => {
+            println!("update available: {} (you have v{})", rel.tag, updater::current_version());
+            println!("run `crabby --update` to install, or update from the GUI.");
+        }
+    }
+    Ok(())
+}
+
+/// `--update`: download + install the newest release, then restart.
+fn update_cli() -> Result<()> {
+    println!("crabby v{} — checking for updates…", updater::current_version());
+    let Some(rel) = updater::check_for_update()? else {
+        println!("up to date ✓");
+        return Ok(());
+    };
+    println!("downloading {} ({} MB)…", rel.tag, rel.bytes / 1_048_576);
+    let last_pct = std::cell::Cell::new(0u64);
+    let staged = updater::download_update(&rel, &|done, total| {
+        if total > 0 {
+            let pct = done * 100 / total;
+            if pct != last_pct.get() && pct % 10 == 0 {
+                last_pct.set(pct);
+                println!("  {pct}% ({done}/{total} bytes)");
+            }
+        }
+    })?;
+    println!("installing + restarting…");
+    updater::install_and_restart(&staged)
 }

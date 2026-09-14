@@ -1,12 +1,17 @@
 [package]
-name = "shockwave-screen-recorder"
-version = "0.1.0"
+name = "crabby"
+version = "1.0.0"
 edition = "2021"
-description = "Shockwave Screen Recorder — lightweight OBS-like WebM 1080p60 game recorder for Windows"
+description = "Crabby — lightweight OBS-like 1080p60 game recorder for Windows"
 license = "MIT"
+authors = ["Crabby"]
+homepage = "https://github.com/Shockwav-e/screen-recorder"
+repository = "https://github.com/Shockwav-e/screen-recorder"
+keywords = ["screen-recorder", "game-capture", "ffmpeg", "windows"]
+rust-version = "1.75"
 
 [[bin]]
-name = "shockwave-rec"
+name = "crabby"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -22,6 +27,9 @@ ctrlc = "2"
 cpal = "0.16"
 eframe = "0.32"
 rfd = "0.17"
+ureq = { version = "3", features = ["json"] }
+semver = "1"
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,39 @@
+# Crabby release pipeline — push a v* tag, every installed copy updates itself.
+#
+# Maintainer flow:
+#   1. Bump `version` in Cargo.toml to match (e.g. 1.1.0), commit.
+#   2. git tag v1.1.0; git push --tags
+#   3. This workflow builds crabby.exe and attaches it to the GitHub Release
+#      as `crabby-windows-x86_64.exe` — the exact asset name the in-app
+#      updater (src/updater.rs) looks for. No installer to re-run.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Stage asset
+        shell: pwsh
+        run: Copy-Item target/release/crabby.exe crabby-windows-x86_64.exe
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: crabby-windows-x86_64.exe
+          generate_release_notes: true

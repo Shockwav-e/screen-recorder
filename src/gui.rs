@@ -1,4 +1,4 @@
-//! Shockwave Screen Recorder GUI (egui/eframe — GPU-accelerated, no webview).
+//! Crabby GUI (egui/eframe — GPU-accelerated, no webview).
 //!
 //! Normal-recorder layout: live preview + transport on top, source / output /
 //! quality sections below, recordings library at the bottom.
@@ -10,7 +10,7 @@
 //!   - Preview is a 480px, 10 fps, latest-only tap (~0.5 MB/frame) — cheap
 //!     enough for an HD 4600 while a game runs.
 
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,6 +21,7 @@ use crate::recorder::{
     describe_source, list_monitors, list_windows, resolve_output, resolve_size, start_session,
     MonitorInfo, WindowInfo,
 };
+use crate::updater;
 
 const BITRATES: [&str; 5] = ["8M", "10M", "12M", "16M", "20M"];
 const RES_OPTIONS: [&str; 3] = ["native", "1080p", "720p"];
@@ -31,6 +32,124 @@ enum Phase {
     Idle,
     Recording,
     Stopping,
+}
+
+/// Background self-update state machine (never blocks the UI thread).
+#[derive(PartialEq)]
+enum UpdatePhase {
+    /// Nothing known yet / no update.
+    Quiet,
+    /// A check is running on a background thread.
+    Checking,
+    /// A newer release exists; dialog offers it.
+    Available,
+    /// Download running; `done/total` bytes.
+    Downloading,
+    /// Staged on disk; one click restarts into it.
+    Ready,
+    /// Last check said we're current.
+    UpToDate,
+    /// Last check/download failed (transient — retry anytime).
+    Failed,
+}
+
+enum UpdateEvent {
+    Checked(Result<Option<updater::ReleaseInfo>, String>),
+    Progress(u64, u64),
+    Downloaded(Result<std::path::PathBuf, String>),
+}
+
+struct UpdateUi {
+    phase: UpdatePhase,
+    info: Option<updater::ReleaseInfo>,
+    staged: Option<std::path::PathBuf>,
+    done: u64,
+    total: u64,
+    error: Option<String>,
+    show_dialog: bool,
+    tx: Sender<UpdateEvent>,
+    rx: Receiver<UpdateEvent>,
+}
+
+impl UpdateUi {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            phase: UpdatePhase::Quiet,
+            info: None,
+            staged: None,
+            done: 0,
+            total: 0,
+            error: None,
+            show_dialog: false,
+            tx,
+            rx,
+        }
+    }
+
+    /// Start a background check (no-op while one is already running).
+    fn spawn_check(&mut self) {
+        if self.phase == UpdatePhase::Checking || self.phase == UpdatePhase::Downloading {
+            return;
+        }
+        self.phase = UpdatePhase::Checking;
+        self.error = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = updater::check_for_update().map_err(|e| format!("{e:?}"));
+            updater::mark_checked();
+            let _ = tx.send(UpdateEvent::Checked(res));
+        });
+    }
+
+    /// Start a background download of the known release.
+    fn spawn_download(&mut self) {
+        let Some(info) = self.info.clone() else { return };
+        self.phase = UpdatePhase::Downloading;
+        self.done = 0;
+        self.total = info.bytes;
+        self.error = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = updater::download_update(&info, &|done, total| {
+                let _ = tx.send(UpdateEvent::Progress(done, total));
+            })
+            .map_err(|e| format!("{e:?}"));
+            let _ = tx.send(UpdateEvent::Downloaded(res));
+        });
+    }
+
+    fn poll(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                UpdateEvent::Checked(Ok(None)) => {
+                    self.phase = UpdatePhase::UpToDate;
+                    self.info = None;
+                }
+                UpdateEvent::Checked(Ok(Some(info))) => {
+                    self.phase = UpdatePhase::Available;
+                    self.info = Some(info);
+                    self.show_dialog = true;
+                }
+                UpdateEvent::Checked(Err(e)) => {
+                    self.phase = UpdatePhase::Failed;
+                    self.error = Some(e);
+                }
+                UpdateEvent::Progress(done, total) => {
+                    self.done = done;
+                    self.total = total;
+                }
+                UpdateEvent::Downloaded(Ok(path)) => {
+                    self.phase = UpdatePhase::Ready;
+                    self.staged = Some(path);
+                }
+                UpdateEvent::Downloaded(Err(e)) => {
+                    self.phase = UpdatePhase::Failed;
+                    self.error = Some(e);
+                }
+            }
+        }
+    }
 }
 
 struct StopOutcome {
@@ -104,10 +223,11 @@ pub struct GuiApp {
 
     done_msg: Option<String>,
     error_msg: Option<String>,
+    update: UpdateUi,
 }
 
 impl GuiApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, updated_from: Option<String>) -> Self {
         // Modern dark theme, slightly rounded, comfortable spacing.
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
@@ -159,7 +279,18 @@ impl GuiApp {
             last_t: Instant::now(),
             done_msg: None,
             error_msg: None,
+            update: UpdateUi::new(),
         };
+        if let Some(from) = updated_from {
+            app.done_msg = Some(format!(
+                "Updated to v{} (was v{from}) — you're on the latest!",
+                updater::current_version()
+            ));
+        }
+        // One silent background check per day; manual checks anytime via header.
+        if updater::should_auto_check() {
+            app.update.spawn_check();
+        }
         app.refresh_sources();
         app.refresh_library();
         app
@@ -397,6 +528,7 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.update.poll();
         // Throttled repaints: ~10 Hz while recording (preview + stats),
         // slower while finalizing, fully static when idle (0% UI cost).
         if self.phase == Phase::Recording {
@@ -405,12 +537,18 @@ impl eframe::App for GuiApp {
         } else if self.phase != Phase::Idle {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
+        // Keep the update badge / progress bar alive without busy-looping.
+        if self.update.phase == UpdatePhase::Checking
+            || self.update.phase == UpdatePhase::Downloading
+        {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
         let recording = self.phase != Phase::Idle;
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Shockwave");
-                ui.label("Screen Recorder · WebM 1080p60");
+                ui.heading("Crabby");
+                ui.label("Screen Recorder · 1080p60");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (dot, txt) = match self.phase {
                         Phase::Idle => (egui::Color32::GRAY, "idle"),
@@ -418,9 +556,167 @@ impl eframe::App for GuiApp {
                         Phase::Stopping => (egui::Color32::YELLOW, "stopping…"),
                     };
                     ui.colored_label(dot, txt);
+                    ui.separator();
+                    // Self-update controls (right side, left of the status).
+                    match self.update.phase {
+                        UpdatePhase::Available => {
+                            if ui
+                                .button(egui::RichText::new("Update available").strong())
+                                .on_hover_text("A newer Crabby is ready — see what's new")
+                                .clicked()
+                            {
+                                self.update.show_dialog = true;
+                            }
+                        }
+                        UpdatePhase::Downloading => {
+                            let pct = if self.update.total > 0 {
+                                self.update.done as f32 / self.update.total as f32
+                            } else {
+                                0.0
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(pct)
+                                    .desired_width(90.0)
+                                    .show_percentage(),
+                            );
+                        }
+                        UpdatePhase::Ready => {
+                            if ui
+                                .button(egui::RichText::new("Restart to update").strong())
+                                .clicked()
+                            {
+                                self.update.show_dialog = true;
+                            }
+                        }
+                        UpdatePhase::Checking => {
+                            ui.spinner();
+                        }
+                        _ => {
+                            if ui
+                                .small_button("Check for updates")
+                                .on_hover_text("Ask GitHub for a newer Crabby")
+                                .clicked()
+                            {
+                                self.update.spawn_check();
+                            }
+                        }
+                    }
+                    ui.weak(format!("v{}", updater::current_version()));
                 });
             });
         });
+
+        // Self-update dialog (modal-ish, closable, never blocks recording).
+        if self.update.show_dialog {
+            let mut open = true;
+            egui::Window::new("Crabby update")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([420.0, 300.0])
+                .show(ctx, |ui| match self.update.phase {
+                    UpdatePhase::Available => {
+                        let tag = self
+                            .update
+                            .info
+                            .as_ref()
+                            .map(|i| i.tag.clone())
+                            .unwrap_or_default();
+                        ui.heading(format!("{tag} is ready"));
+                        ui.label(format!(
+                            "You're on v{} — no reinstall needed, one click swaps the exe.",
+                            updater::current_version()
+                        ));
+                        ui.separator();
+                        ui.strong("What's new:");
+                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                            ui.label(
+                                self.update
+                                    .info
+                                    .as_ref()
+                                    .map(|i| i.notes.as_str())
+                                    .unwrap_or(""),
+                            );
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(egui::RichText::new("Download + restart").strong())
+                                .clicked()
+                            {
+                                self.update.spawn_download();
+                            }
+                            if ui.button("Later").clicked() {
+                                self.update.show_dialog = false;
+                            }
+                        });
+                    }
+                    UpdatePhase::Downloading => {
+                        let (done, total) = (self.update.done, self.update.total);
+                        ui.label("Downloading update…");
+                        ui.add(
+                            egui::ProgressBar::new(if total > 0 {
+                                done as f32 / total as f32
+                            } else {
+                                0.0
+                            })
+                            .show_percentage(),
+                        );
+                        ui.weak(format!(
+                            "{} / {} MB",
+                            done / 1_048_576,
+                            total.max(1) / 1_048_576
+                        ));
+                    }
+                    UpdatePhase::Ready => {
+                        ui.heading("Ready to restart");
+                        ui.label("The new version is downloaded. Restart swaps it in.");
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(egui::RichText::new("Restart now").strong())
+                                .clicked()
+                            {
+                                if let Some(staged) = self.update.staged.clone() {
+                                    if let Err(e) =
+                                        updater::install_and_restart(&staged)
+                                    {
+                                        self.error_msg =
+                                            Some(format!("couldn't install update: {e:?}"));
+                                        self.update.show_dialog = false;
+                                    }
+                                    // On success this process exits via the updater.
+                                }
+                            }
+                            if ui.button("Later").clicked() {
+                                self.update.show_dialog = false;
+                            }
+                        });
+                    }
+                    UpdatePhase::Failed => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 120, 120),
+                            self.update.error.clone().unwrap_or_else(|| "update failed".into()),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Retry").clicked() {
+                                self.update.spawn_check();
+                            }
+                            if ui.button("Close").clicked() {
+                                self.update.show_dialog = false;
+                            }
+                        });
+                    }
+                    _ => {
+                        ui.label("You're on the latest version.");
+                        if ui.button("Close").clicked() {
+                            self.update.show_dialog = false;
+                        }
+                    }
+                });
+            if !open {
+                self.update.show_dialog = false;
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -851,7 +1147,7 @@ impl eframe::App for GuiApp {
     }
 }
 
-pub fn run() -> Result<()> {
+pub fn run(updated_from: Option<String>) -> Result<()> {
     let icon =
         eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon-256.png")[..])
             .expect("assets/icon-256.png is corrupt");
@@ -863,9 +1159,9 @@ pub fn run() -> Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Shockwave Screen Recorder",
+        "Crabby Screen Recorder",
         options,
-        Box::new(|cc| Ok(Box::new(GuiApp::new(cc)) as Box<dyn eframe::App>)),
+        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, updated_from)) as Box<dyn eframe::App>)),
     )
     .map_err(|e| anyhow::anyhow!("GUI failed: {e}"))
 }

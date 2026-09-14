@@ -830,7 +830,7 @@ fn bitrate_kbps(s: &str) -> u64 {
     // ffmpeg builds (Unrecognized option 'vsync') — passing it kills ffmpeg.
     cmd.arg(&cfg.output);
     cmd.spawn().context(
-        "failed to spawn ffmpeg. Install it (winget install Gyan.FFmpeg) or let lite-rec auto-download it",
+        "failed to spawn ffmpeg. Install it (winget install Gyan.FFmpeg) or let crabby auto-download it",
     )
 }
 
