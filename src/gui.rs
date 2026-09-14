@@ -7,8 +7,7 @@
 //!   - UI thread never blocks: capture + encode run on background threads,
 //!     `Session::wait()` finalizes on a helper thread during Stop.
 //!   - Repaints throttled to ~10 Hz while recording; fully static when idle.
-//!   - Preview is a 480px, 10 fps, latest-only tap (~0.5 MB/frame) — cheap
-//!     enough for an HD 4600 while a game runs.
+//!   - Preview is a 480px, 10 fps, latest-only tap (~0.5 MB/frame).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -16,16 +15,33 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::egui;
 
+use crate::caps::capabilities;
+use crate::config::{self, default_video_dir};
 use crate::recorder::{
-    AudioMode, Codec, Quality, RecordConfig, Snapshot, Source, Session, auto_quality,
-    describe_source, list_monitors, list_windows, resolve_output, resolve_size, start_session,
+    AudioCodec, AudioMode, Codec, Container, RecordConfig, Snapshot, Source, Session, Tier,
+    check_tier, default_tier, describe_source, encoder_display, list_monitors, list_windows,
+    resolve_output, resolve_size, start_session, validate_matrix,
     MonitorInfo, WindowInfo,
 };
 use crate::updater;
 
-const BITRATES: [&str; 5] = ["8M", "10M", "12M", "16M", "20M"];
+/// Index 0 = follow the tier; the rest override it (power users).
+const BITRATES: [&str; 6] = ["Auto (tier)", "8M", "10M", "12M", "16M", "20M"];
 const RES_OPTIONS: [&str; 3] = ["native", "1080p", "720p"];
 const RES_LABELS: [&str; 3] = ["Native (app size, no bars)", "1080p fixed", "720p fixed"];
+/// Parallel to `enc_override`: 0 = auto, then one entry per Codec variant.
+const ENC_NAMES: [&str; 10] = [
+    "Auto (H.264 best available)",
+    "H.264 auto",
+    "H.264 Intel Quick Sync",
+    "H.264 NVIDIA NVENC",
+    "H.264 AMD AMF",
+    "H.264 software x264",
+    "H.265 auto (hardware)",
+    "AV1 auto (hardware)",
+    "VP8",
+    "VP9",
+];
 
 #[derive(PartialEq)]
 enum Phase {
@@ -199,15 +215,20 @@ pub struct GuiApp {
 
     dir: String,
     filename: String,
-    quality: Quality,
+    tier: Tier,
     bitrate_sel: usize,
     res_sel: usize,
     enc_sel: usize,
+    container_sel: usize,
+    /// None = follow the container (AAC for MP4, Opus otherwise).
+    audio_codec_sel: Option<AudioCodec>,
     audio: AudioMode,
     fps60: bool,
     no_cursor: bool,
     auto_stop: bool,
     stop_secs: u32,
+    /// 0 = auto (CPU count); exposed for CLI/GUI parity.
+    threads: u32,
 
     phase: Phase,
     session: Option<Session>,
@@ -223,6 +244,8 @@ pub struct GuiApp {
 
     done_msg: Option<String>,
     error_msg: Option<String>,
+    /// Why the current recording uses its encoder (set at Start).
+    enc_note: Option<String>,
     update: UpdateUi,
 }
 
@@ -243,6 +266,26 @@ impl GuiApp {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         cc.egui_ctx.set_style(style);
 
+        // Initial values: config file wins over built-ins (CLI flags would
+        // win over both, but the GUI *is* the flag surface — it edits live).
+        let file_cfg = config::load(None).unwrap_or_default();
+        let caps = capabilities();
+        let tier = file_cfg.quality.unwrap_or_else(|| default_tier(caps));
+        let container = file_cfg.container.unwrap_or_default();
+        let enc_sel = file_cfg
+            .codec
+            .map(|c| match c {
+                Codec::H264 => 1,
+                Codec::H264Qsv => 2,
+                Codec::H264Nvenc => 3,
+                Codec::H264Amf => 4,
+                Codec::X264 => 5,
+                Codec::H265 => 6,
+                Codec::Av1 => 7,
+                Codec::Vp8 => 8,
+                Codec::Vp9 => 9,
+            })
+            .unwrap_or(0);
         let mut app = Self {
             monitors: Vec::new(),
             windows: Vec::new(),
@@ -251,21 +294,24 @@ impl GuiApp {
             monitor_sel: 0,
             win_filter: String::new(),
             win_sel: None,
-            dir: r"D:\Recordings".to_owned(),
-            filename: "gameplay.webm".to_owned(),
-            quality: auto_quality(),
-            // match the auto preset's bitrate (Smooth -> 8M, YouTube -> 12M)
-            bitrate_sel: match auto_quality() {
-                Quality::Balanced => 0,
-                Quality::Youtube => 2,
-            },
+            dir: file_cfg.dir.unwrap_or_else(default_video_dir),
+            filename: "recording".to_owned(),
+            tier,
+            bitrate_sel: 0, // Auto (tier)
             res_sel: 0, // native app size
-            enc_sel: 0, // auto: best for this PC
-            audio: AudioMode::System,
+            enc_sel,
+            container_sel: match container {
+                Container::Mp4 => 0,
+                Container::Mkv => 1,
+                Container::Webm => 2,
+            },
+            audio_codec_sel: file_cfg.audio_codec,
+            audio: file_cfg.audio.unwrap_or(AudioMode::System),
             fps60: true,
             no_cursor: false,
             auto_stop: false,
             stop_secs: 60,
+            threads: file_cfg.threads.unwrap_or(0),
             phase: Phase::Idle,
             session: None,
             pending: None,
@@ -279,6 +325,7 @@ impl GuiApp {
             last_t: Instant::now(),
             done_msg: None,
             error_msg: None,
+            enc_note: None,
             update: UpdateUi::new(),
         };
         if let Some(from) = updated_from {
@@ -296,7 +343,7 @@ impl GuiApp {
         app
     }
 
-    /// Recordings library: .webm files in the save folder, newest first.
+    /// Recordings library: video files in the save folder, newest first.
     fn refresh_library(&mut self) {
         self.lib_files.clear();
         let Ok(rd) = std::fs::read_dir(&self.dir) else {
@@ -304,7 +351,12 @@ impl GuiApp {
         };
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.extension().map(|e| e.eq_ignore_ascii_case("webm")).unwrap_or(false) {
+            let is_video = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("webm") || e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("mkv"))
+                .unwrap_or(false);
+            if is_video {
                 if let Ok(md) = entry.metadata() {
                     self.lib_files.push(LibFile {
                         name: p
@@ -318,7 +370,7 @@ impl GuiApp {
                 }
             }
         }
-        self.lib_files.sort_by(|a, b| b.modified.cmp(&a.modified));
+        self.lib_files.sort_by_key(|f| std::cmp::Reverse(f.modified));
     }
 
     fn refresh_sources(&mut self) {
@@ -340,26 +392,46 @@ impl GuiApp {
         }
     }
 
-    fn selected_bitrate(&self) -> String {
-        BITRATES[self.bitrate_sel.min(BITRATES.len() - 1)].to_owned()
+    /// Bitrate override, if any. Index 0 follows the tier (scaled to the
+    /// recording size); the rest are fixed power-user values.
+    fn selected_bitrate(&self) -> Option<String> {
+        if self.bitrate_sel == 0 {
+            None
+        } else {
+            BITRATES
+                .get(self.bitrate_sel)
+                .map(|s| (*s).to_owned())
+        }
     }
 
-    /// Manual encoder override (None = follow the quality preset).
+    /// Manual encoder override (None = H.264 auto). Parallel to ENC_NAMES.
     fn enc_override(&self) -> Option<Codec> {
         match self.enc_sel {
             1 => Some(Codec::H264),
             2 => Some(Codec::H264Qsv),
             3 => Some(Codec::H264Nvenc),
             4 => Some(Codec::H264Amf),
-            5 => Some(Codec::Vp8),
-            6 => Some(Codec::Vp9),
+            5 => Some(Codec::X264),
+            6 => Some(Codec::H265),
+            7 => Some(Codec::Av1),
+            8 => Some(Codec::Vp8),
+            9 => Some(Codec::Vp9),
             _ => None,
+        }
+    }
+
+    fn selected_container(&self) -> Container {
+        match self.container_sel {
+            1 => Container::Mkv,
+            2 => Container::Webm,
+            _ => Container::Mp4,
         }
     }
 
     fn start(&mut self) {
         self.done_msg = None;
         self.error_msg = None;
+        self.enc_note = None;
 
         let source = if self.use_window {
             let Some(i) = self.win_sel else {
@@ -382,9 +454,18 @@ impl GuiApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "gameplay.webm".to_owned());
-        let codec: Codec = self.enc_override().unwrap_or_else(|| self.quality.codec());
-        let output = match resolve_output(&fname, &self.dir, codec.container_ext()) {
+            .unwrap_or_else(|| "recording".to_owned());
+        let codec: Codec = self.enc_override().unwrap_or(Codec::H264);
+        let container = self.selected_container();
+        let audio_codec = self.audio_codec_sel.unwrap_or_else(|| container.default_audio());
+        // Parse-time validation first: never start a capture we can't encode.
+        if let Err(e) = validate_matrix(codec, container, audio_codec)
+            .and_then(|()| check_tier(codec, self.tier).map(|_| ()))
+        {
+            self.error_msg = Some(format!("{e:?}"));
+            return;
+        }
+        let output = match resolve_output(&fname, &self.dir, container) {
             Ok(p) => p,
             Err(e) => {
                 self.error_msg = Some(format!("bad output: {e:?}"));
@@ -407,9 +488,14 @@ impl GuiApp {
             height,
             source,
             codec,
-            bitrate: self.selected_bitrate(),
-            cpu_used: self.quality.cpu_used(),
-            threads: 4,
+            bitrate: self
+                .selected_bitrate()
+                .unwrap_or_else(|| self.tier.bitrate_for(width, height)),
+            cpu_used: self.tier.vpx_cpu_used(),
+            tier: self.tier,
+            container,
+            audio_codec,
+            threads: self.threads,
             duration: self.auto_stop.then_some(self.stop_secs.max(5) as u64),
             no_cursor: self.no_cursor,
             audio: self.audio,
@@ -429,6 +515,10 @@ impl GuiApp {
                 self.preview_tex = None;
                 self.session = Some(sess);
                 self.phase = Phase::Recording;
+                // Already validated above; recompute for the note (cached probe).
+                self.enc_note = check_tier(codec, self.tier)
+                    .map(|(id, why)| format!("{} — {why}", encoder_display(id)))
+                    .ok();
             }
             Err(e) => self.error_msg = Some(format!("couldn't start: {e:?}")),
         }
@@ -871,7 +961,7 @@ impl eframe::App for GuiApp {
                 });
 
                 ui.group(|ui| {
-                    ui.strong("2 · Where to save (D disk)");
+                    ui.strong("2 · Where to save");
                     ui.horizontal(|ui| {
                         ui.label("Folder:");
                         ui.add_enabled(
@@ -892,35 +982,33 @@ impl eframe::App for GuiApp {
                         ui.add_enabled(
                             !recording,
                             egui::TextEdit::singleline(&mut self.filename)
-                                .hint_text("gameplay.webm")
+                                .hint_text("recording")
                                 .desired_width(300.0),
                         );
                     });
+                    ui.weak("Container extension (.mp4/.mkv/.webm) is added automatically.");
                     ui.weak("Never overwritten — existing names get _001, _002…");
                 });
 
                 ui.group(|ui| {
-                    ui.strong("3 · Quality (for YouTube)");
+                    ui.strong("3 · Quality");
                     ui.add_enabled_ui(!recording, |ui| {
-                        if ui
-                            .radio_value(&mut self.quality, Quality::Youtube, Quality::Youtube.label())
-                            .clicked()
-                        {
-                            self.bitrate_sel = 2; // 12M
-                        }
-                        ui.weak("H.264 MP4, hardware-encoded on Intel — smooth 60fps, YouTube's favorite format.");
-                        if ui
-                            .radio_value(&mut self.quality, Quality::Balanced, Quality::Balanced.label())
-                            .clicked()
-                        {
-                            self.bitrate_sel = 0; // 8M
-                        }
-                        ui.weak("VP8 WebM, lowest CPU. Drafts and software-only PCs.");
+                        ui.radio_value(&mut self.tier, Tier::Fastest, Tier::Fastest.label());
+                        ui.weak("Lowest load. Weak hardware or quick drafts.");
+                        ui.radio_value(&mut self.tier, Tier::Balanced, Tier::Balanced.label());
+                        ui.weak("Good quality per bit on any machine.");
+                        ui.radio_value(&mut self.tier, Tier::High, Tier::High.label());
+                        ui.weak("Higher bitrate, slower preset. Needs headroom.");
+                        ui.radio_value(&mut self.tier, Tier::Lossless, Tier::Lossless.label());
+                        ui.weak("Exact pixels, huge files. x264/VP9 only.");
                     });
                     ui.horizontal(|ui| {
                         ui.label("Bitrate:");
+                        let sel_txt = self
+                            .selected_bitrate()
+                            .unwrap_or_else(|| "Auto (tier)".to_owned());
                         egui::ComboBox::from_id_salt("br")
-                            .selected_text(self.selected_bitrate())
+                            .selected_text(sel_txt)
                             .show_ui(ui, |ui| {
                                 for (i, b) in BITRATES.iter().enumerate() {
                                     ui.selectable_value(&mut self.bitrate_sel, i, *b);
@@ -971,24 +1059,60 @@ impl eframe::App for GuiApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Encoder:");
-                        let enc_names = [
-                            "Auto (best for this PC)",
-                            "H.264 auto",
-                            "H.264 Intel Quick Sync",
-                            "H.264 NVIDIA NVENC",
-                            "H.264 AMD AMF",
-                            "VP8 WebM",
-                            "VP9 WebM",
-                        ];
                         egui::ComboBox::from_id_salt("enc")
-                            .selected_text(enc_names[self.enc_sel.min(enc_names.len() - 1)])
+                            .selected_text(ENC_NAMES[self.enc_sel.min(ENC_NAMES.len() - 1)])
                             .show_ui(ui, |ui| {
-                                for (i, n) in enc_names.iter().enumerate() {
+                                for (i, n) in ENC_NAMES.iter().enumerate() {
                                     ui.selectable_value(&mut self.enc_sel, i, *n);
                                 }
                             });
+                        ui.label("File:");
+                        let cont_names = ["MP4", "MKV", "WebM"];
+                        egui::ComboBox::from_id_salt("cont")
+                            .selected_text(cont_names[self.container_sel.min(2)])
+                            .show_ui(ui, |ui| {
+                                for (i, n) in cont_names.iter().enumerate() {
+                                    ui.selectable_value(&mut self.container_sel, i, *n);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Sound:");
+                        let ac_names = ["Auto", "Opus", "AAC"];
+                        let ac_sel = match self.audio_codec_sel {
+                            None => 0,
+                            Some(AudioCodec::Opus) => 1,
+                            Some(AudioCodec::Aac) => 2,
+                        };
+                        egui::ComboBox::from_id_salt("acodec")
+                            .selected_text(ac_names[ac_sel])
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(ac_sel == 0, ac_names[0]).clicked() {
+                                    self.audio_codec_sel = None;
+                                }
+                                if ui.selectable_label(ac_sel == 1, ac_names[1]).clicked() {
+                                    self.audio_codec_sel = Some(AudioCodec::Opus);
+                                }
+                                if ui.selectable_label(ac_sel == 2, ac_names[2]).clicked() {
+                                    self.audio_codec_sel = Some(AudioCodec::Aac);
+                                }
+                            });
+                        ui.weak("Auto: AAC for MP4, Opus otherwise.");
                     });
                     ui.weak("Win10 has no per-app audio — mute other apps for clean game sound.");
+                    ui.horizontal(|ui| {
+                        ui.label("Threads:");
+                        let max_t = capabilities().cpu_threads.max(1);
+                        ui.add_enabled(
+                            !recording,
+                            egui::Slider::new(&mut self.threads, 0..=max_t),
+                        );
+                        ui.weak(if self.threads == 0 {
+                            format!("Auto ({max_t})")
+                        } else {
+                            String::new()
+                        });
+                    });
                     ui.horizontal(|ui| {
                         ui.add_enabled(
                             !recording,
@@ -1046,8 +1170,11 @@ impl eframe::App for GuiApp {
                             {
                                 ui.colored_label(
                                     egui::Color32::YELLOW,
-                                    "Dropping frames — switch to Balanced or 30 fps.",
+                                    "Dropping frames — step down a tier or try 30 fps.",
                                 );
+                            }
+                            if let Some(n) = &self.enc_note {
+                                ui.weak(n);
                             }
                         }
                         Phase::Stopping => {
@@ -1063,15 +1190,14 @@ impl eframe::App for GuiApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if ui.button("Open folder").clicked() {
-                                    if std::process::Command::new("explorer")
+                                if ui.button("Open folder").clicked()
+                                    && std::process::Command::new("explorer")
                                         .arg(&self.dir)
                                         .spawn()
                                         .is_err()
-                                    {
-                                        self.error_msg =
-                                            Some("couldn't open the save folder".to_owned());
-                                    }
+                                {
+                                    self.error_msg =
+                                        Some("couldn't open the save folder".to_owned());
                                 }
                                 if ui.button("Refresh").clicked() {
                                     self.refresh_library();
@@ -1090,7 +1216,7 @@ impl eframe::App for GuiApp {
                                     let mut nm = f.name.clone();
                                     if nm.len() > 32 {
                                         nm.truncate(29);
-                                        nm.push_str("…");
+                                        nm.push('…');
                                     }
                                     ui.monospace(nm);
                                     ui.with_layout(

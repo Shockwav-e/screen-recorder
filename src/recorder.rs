@@ -1,11 +1,15 @@
-//! Shared recording core: WGC capture -> bounded queue -> ffmpeg WebM.
+//! Shared recording core: WGC capture -> bounded queue -> ffmpeg.
 //! Used by both the CLI and the egui GUI.
 //!
-//! Performance design (i5-4570, 4 threads, 16 GB, 1080p display):
+//! Performance design:
+//!
 //!   - GPU-composited event-driven capture (idle screen ~= 0% CPU)
 //!   - fixed-size pipe, center crop/pad in-Rust (cheap memcpy, no scaler)
-//!   - bounded 2-frame channel + try_send (never blocks capture; drops = realtime)
-//!   - buffer reuse (no per-frame alloc), CFR pacer thread, realtime libvpx flags
+//!   - bounded channel + try_send (never blocks capture; drops = realtime)
+//!   - buffer reuse (no per-frame alloc), CFR pacer thread, realtime encoder flags
+//!
+//! Hardware specifics (which encoder, how many threads, what display) come
+//! from `crate::caps`, never from hardcoded machine assumptions.
 
 use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
@@ -21,6 +25,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::ValueEnum;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use serde::Deserialize;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -31,109 +36,205 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+use crate::caps::{Capabilities, capabilities, resolve_av1, resolve_h264, resolve_hevc};
+
+/// Video codec choice. Hardware variants fall back across vendors via
+/// `crate::caps`; forced vendor variants bail with a clear message when
+/// their GPU/driver is missing. Values are kebab-case on the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Codec {
-    /// Auto: best available on this PC — Intel QSV, then NVIDIA NVENC, then
-    /// AMD AMF, then software x264. MP4. The default: fastest smooth option.
+    /// Auto H.264: best available — QSV, then NVENC, then AMF, then x264.
     H264,
-    /// Intel Quick Sync H.264 (forced). MP4. Near-zero CPU on Intel iGPUs.
+    /// Forced Intel Quick Sync H.264. Needs an Intel iGPU + driver.
     H264Qsv,
-    /// NVIDIA NVENC H.264 (forced). MP4. Needs an NVIDIA GPU + driver.
+    /// Forced NVIDIA NVENC H.264. Needs an NVIDIA GPU + driver.
     H264Nvenc,
-    /// AMD AMF H.264 (forced). MP4. Needs an AMD GPU + driver.
+    /// Forced AMD AMF H.264. Needs an AMD GPU + driver.
     H264Amf,
-    /// WebM VP8 software — lightest CPU, universal playback.
+    /// Forced software x264 (also the lossless-tier vehicle). Any x86_64.
+    X264,
+    /// Auto HEVC/H.265 hardware (QSV → NVENC → AMF). No software fallback:
+    /// software HEVC at 60 fps is unusable, so absence is an error.
+    H265,
+    /// Auto AV1 hardware (QSV → NVENC → AMF). Opt-in. No software fallback.
+    Av1,
+    /// Software VP8. Lowest CPU, universal playback.
     Vp8,
-    /// WebM VP9 software — better compression, needs more CPU.
+    /// Software VP9. Better compression, needs more CPU.
     Vp9,
 }
 
 impl Codec {
-    /// Container this codec needs (WebM can't hold H.264).
-    pub fn container_ext(self) -> &'static str {
+    /// CLI spelling (`--codec h264-qsv`).
+    pub fn cli_name(self) -> &'static str {
         match self {
-            Codec::H264 | Codec::H264Qsv | Codec::H264Nvenc | Codec::H264Amf => "mp4",
-            _ => "webm",
+            Codec::H264 => "h264",
+            Codec::H264Qsv => "h264-qsv",
+            Codec::H264Nvenc => "h264-nvenc",
+            Codec::H264Amf => "h264-amf",
+            Codec::X264 => "x264",
+            Codec::H265 => "h265",
+            Codec::Av1 => "av1",
+            Codec::Vp8 => "vp8",
+            Codec::Vp9 => "vp9",
         }
     }
 }
 
-/// Probe results for the hardware encoders, cached after first use.
-#[derive(Debug, Clone, Copy, Default)]
-struct HwEncoders {
-    qsv: bool,
-    nvenc: bool,
-    amf: bool,
+/// Output container. Each has different crash-safety properties, see
+/// `container_mux_args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Container {
+    /// Fragmented MP4: playable even if the process is killed mid-record.
+    #[default]
+    Mp4,
+    /// Matroska: broadly compatible, bounded clusters for kill-safety.
+    Mkv,
+    /// WebM: VP8/VP9/AV1 + Opus only, bounded clusters for kill-safety.
+    Webm,
 }
 
-fn probe_hw_encoders() -> HwEncoders {
-    static PROBE: std::sync::OnceLock<HwEncoders> = std::sync::OnceLock::new();
-    *PROBE.get_or_init(|| {
-        // Listing an encoder proves nothing (NVENC is listed with no NVIDIA
-        // card here) — do a real 5-frame hardware encode to know it inits.
-        let works = |enc: &str| {
-            std::process::Command::new(ffmpeg_sidecar::paths::ffmpeg_path())
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "nullsrc=s=64x64:r=30:d=1",
-                    "-frames:v",
-                    "5",
-                    "-c:v",
-                    enc,
-                    "-f",
-                    "null",
-                    "-",
-                ])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        };
-        HwEncoders { qsv: works("h264_qsv"), nvenc: works("h264_nvenc"), amf: works("h264_amf") }
-    })
-}
-
-/// True when Intel Quick Sync H.264 is usable (this PC's hardware path).
-pub fn qsv_available() -> bool {
-    probe_hw_encoders().qsv
-}
-
-/// Concrete ffmpeg encoder for a codec choice. Auto prefers hardware in
-/// QSV -> NVENC -> AMF order, then software x264. Forced vendors bail with
-/// a clear message when their GPU/driver is missing.
-pub fn video_encoder(codec: Codec) -> Result<&'static str> {
-    let hw = probe_hw_encoders();
-    match codec {
-        Codec::H264Qsv => hw
-            .qsv
-            .then_some("h264_qsv")
-            .context("Intel Quick Sync not available (needs an Intel iGPU + driver)"),
-        Codec::H264Nvenc => hw
-            .nvenc
-            .then_some("h264_nvenc")
-            .context("NVIDIA NVENC not available (needs an NVIDIA GPU + driver)"),
-        Codec::H264Amf => hw
-            .amf
-            .then_some("h264_amf")
-            .context("AMD AMF not available (needs an AMD GPU + driver)"),
-        Codec::H264 => Ok(if hw.qsv {
-            "h264_qsv"
-        } else if hw.nvenc {
-            "h264_nvenc"
-        } else if hw.amf {
-            "h264_amf"
-        } else {
-            "libx264"
-        }),
-        Codec::Vp8 => Ok("libvpx"),
-        Codec::Vp9 => Ok("libvpx-vp9"),
+impl Container {
+    pub fn ext(self) -> &'static str {
+        match self {
+            Container::Mp4 => "mp4",
+            Container::Mkv => "mkv",
+            Container::Webm => "webm",
+        }
+    }
+    /// Audio codec used when the user doesn't pick one explicitly.
+    pub fn default_audio(self) -> AudioCodec {
+        match self {
+            Container::Mp4 => AudioCodec::Aac,
+            Container::Mkv | Container::Webm => AudioCodec::Opus,
+        }
+    }
+    pub fn allows_audio(self, a: AudioCodec) -> bool {
+        match (self, a) {
+            (Container::Mp4, AudioCodec::Aac) => true,
+            (Container::Mkv, _) => true, // MKV officially supports both
+            (Container::Webm, AudioCodec::Opus) => true,
+            _ => false,
+        }
+    }
+    pub fn allows_video(self, c: Codec) -> bool {
+        match self {
+            Container::Mp4 => matches!(
+                c,
+                Codec::H264
+                    | Codec::H264Qsv
+                    | Codec::H264Nvenc
+                    | Codec::H264Amf
+                    | Codec::X264
+                    | Codec::H265
+                    | Codec::Av1
+            ),
+            Container::Mkv => true, // MKV holds everything we encode
+            Container::Webm => matches!(c, Codec::Vp8 | Codec::Vp9 | Codec::Av1),
+        }
     }
 }
 
+/// Audio codec. Follows the container by default (`Container::default_audio`);
+/// `--audio-codec` overrides within the container's allowed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioCodec {
+    #[default]
+    Opus,
+    Aac,
+}
+
+impl AudioCodec {
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            AudioCodec::Opus => "opus",
+            AudioCodec::Aac => "aac",
+        }
+    }
+    pub(crate) fn ffmpeg_id(self) -> &'static str {
+        match self {
+            // Native AAC (no libfdk in our ffmpeg build); Opus via libopus.
+            AudioCodec::Opus => "libopus",
+            AudioCodec::Aac => "aac",
+        }
+    }
+}
+
+/// Reject invalid codec+container+audio combinations at argument-parse time
+/// with a clear message, instead of failing (or silently renaming files)
+/// deep in the encode pipeline.
+pub fn validate_matrix(
+    codec: Codec,
+    container: Container,
+    audio: AudioCodec,
+) -> Result<()> {
+    if !container.allows_video(codec) {
+        bail!(
+            "--codec {} can't go in .{} — {} holds {}; try --container mp4, mkv or webm",
+            codec.cli_name(),
+            container.ext(),
+            match container {
+                Container::Mp4 => "MP4",
+                Container::Mkv => "MKV",
+                Container::Webm => "WebM",
+            },
+            match container {
+                Container::Mp4 => "H.264, H.265, AV1",
+                Container::Mkv => "anything",
+                Container::Webm => "VP8, VP9, AV1",
+            },
+        );
+    }
+    if !container.allows_audio(audio) {
+        bail!(
+            "--audio-codec {} isn't allowed in .{} ({} supports {}) — drop the flag to use {}",
+            audio.cli_name(),
+            container.ext(),
+            container.ext(),
+            match container {
+                Container::Mp4 => "AAC",
+                Container::Mkv => "Opus or AAC",
+                Container::Webm => "Opus",
+            },
+            container.default_audio().cli_name(),
+        );
+    }
+    Ok(())
+}
+
+/// Concrete ffmpeg encoder for a codec choice, plus a one-line human reason
+/// ("no Quick Sync, NVIDIA NVENC available") for logs and bug reports.
+pub fn video_encoder_verbose(codec: Codec) -> Result<(&'static str, String)> {
+    let caps = capabilities();
+    match codec {
+        Codec::H264Qsv if !caps.h264.qsv => {
+            bail!("forced h264-qsv unavailable: no Intel Quick Sync (needs an Intel iGPU + driver)")
+        }
+        Codec::H264Qsv => Ok(("h264_qsv", "forced Intel Quick Sync".to_owned())),
+        Codec::H264Nvenc if !caps.h264.nvenc => {
+            bail!("forced h264-nvenc unavailable: no NVIDIA NVENC (needs an NVIDIA GPU + driver)")
+        }
+        Codec::H264Nvenc => Ok(("h264_nvenc", "forced NVIDIA NVENC".to_owned())),
+        Codec::H264Amf if !caps.h264.amf => {
+            bail!("forced h264-amf unavailable: no AMD AMF (needs an AMD GPU + driver)")
+        }
+        Codec::H264Amf => Ok(("h264_amf", "forced AMD AMF".to_owned())),
+        Codec::H264 => Ok(resolve_h264(&caps.h264)),
+        Codec::X264 => Ok(("libx264", "forced software x264".to_owned())),
+        Codec::H265 => resolve_hevc(&caps.hevc).map_err(anyhow::Error::msg),
+        Codec::Av1 => resolve_av1(&caps.av1).map_err(anyhow::Error::msg),
+        Codec::Vp8 => Ok(("libvpx", "software VP8".to_owned())),
+        Codec::Vp9 => Ok(("libvpx-vp9", "software VP9".to_owned())),
+    }
+}
+
+/// Concrete ffmpeg encoder for a codec choice.
+pub fn video_encoder(codec: Codec) -> Result<&'static str> {
+    Ok(video_encoder_verbose(codec)?.0)
+}
 /// Short display name for a concrete encoder id.
 pub fn encoder_display(enc: &'static str) -> &'static str {
     match enc {
@@ -141,66 +242,141 @@ pub fn encoder_display(enc: &'static str) -> &'static str {
         "h264_nvenc" => "H.264-NVENC",
         "h264_amf" => "H.264-AMF",
         "libx264" => "H.264-x264",
+        "hevc_qsv" => "H.265-QSV",
+        "hevc_nvenc" => "H.265-NVENC",
+        "hevc_amf" => "H.265-AMF",
+        "av1_qsv" => "AV1-QSV",
+        "av1_nvenc" => "AV1-NVENC",
+        "av1_amf" => "AV1-AMF",
         "libvpx" => "VP8",
         "libvpx-vp9" => "VP9",
         _ => enc,
     }
 }
 
-/// Quality presets. YouTube re-encodes everything you upload, so starting from
-/// a high-bitrate master is what keeps the final video sharp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
-pub enum Quality {
-    /// VP9 1080p60 @ 16M, cpu-used 5. For YouTube uploads (recommended: YT
-    /// wants ~12 Mbps for 1080p60, 16M master gives it headroom).
+/// Quality tiers: vendor-neutral names describing encode effort vs quality.
+/// Bitrates scale with resolution (`bitrate_for`) instead of fixed strings,
+/// and presets are per-encoder-family. Values are kebab-case on the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tier {
+    /// Lowest CPU/GPU load, lower quality. Weak hardware, commentary drafts.
+    Fastest,
+    /// The default. Good quality per bit on any machine.
     #[default]
-    Youtube,
-    /// VP8 1080p60 @ 8M, cpu-used 8 (fastest). Lowest CPU, still decent.
     Balanced,
+    /// Higher bitrate + slower preset. Needs encode headroom.
+    /// Spelled `high-quality` on the CLI and in config files (not `high`).
+    #[serde(rename = "high-quality")]
+    #[value(name = "high-quality")]
+    High,
+    /// Mathematically lossless where the codec supports it (x264, VP9).
+    /// Hardware encoders and VP8 are rejected with guidance, not silence.
+    Lossless,
 }
 
-impl Quality {
-    pub fn codec(self) -> Codec {
+impl Tier {
+    /// CLI spelling (`--quality high-quality`).
+    pub fn cli_name(self) -> &'static str {
         match self {
-            // H.264 MP4 is YouTube's preferred upload format; Quick Sync
-            // encodes it in hardware (near-zero CPU on Intel iGPUs).
-            Quality::Youtube => Codec::H264,
-            Quality::Balanced => Codec::Vp8,
-        }
-    }
-    pub fn bitrate(self) -> &'static str {
-        match self {
-            Quality::Youtube => "12M", // YT wants ~12 Mbps for 1080p60
-            Quality::Balanced => "8M",
-        }
-    }
-    pub fn cpu_used(self) -> u8 {
-        match self {
-            // Max speed: on a 4-thread Haswell the encoder must hold 60 fps
-            // while the game itself needs CPU. 16M bitrate preserves quality.
-            Quality::Youtube => 8,
-            Quality::Balanced => 8,
+            Tier::Fastest => "fastest",
+            Tier::Balanced => "balanced",
+            Tier::High => "high-quality",
+            Tier::Lossless => "lossless",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
-            Quality::Youtube => "YouTube HQ (H.264 12M)",
-            Quality::Balanced => "Smooth 60fps (VP8 8M)",
+            Tier::Fastest => "Fastest (lowest load)",
+            Tier::Balanced => "Balanced (default)",
+            Tier::High => "High quality (needs headroom)",
+            Tier::Lossless => "Lossless (huge files, x264/VP9 only)",
+        }
+    }
+    /// Reference bitrate at 1080p60, Mbps. Scales with pixel count.
+    fn base_mbps(self) -> f64 {
+        match self {
+            Tier::Fastest => 6.0,
+            Tier::Balanced => 10.0,
+            Tier::High => 20.0,
+            Tier::Lossless => 0.0, // unused: lossless modes ignore bitrate
+        }
+    }
+    /// Bitrate target like `"12M"`, scaled linearly by pixel count vs 1080p
+    /// and clamped to a sane range. A 720p balanced record asks ~4M; a 4K
+    /// high-quality one asks ~80M.
+    pub fn bitrate_for(self, w: u32, h: u32) -> String {
+        let mp = (w.max(64) as f64 * h.max(64) as f64) / (1920.0 * 1080.0);
+        let m = (self.base_mbps() * mp).clamp(1.0, 80.0);
+        format!("{m:.0}M")
+    }
+    /// libvpx speed 0(best)..8(fastest). Lossless is exact at any speed;
+    /// 2 keeps 1080p60 near-realtime on decent CPUs.
+    pub fn vpx_cpu_used(self) -> u8 {
+        match self {
+            Tier::Fastest => 8,
+            Tier::Balanced => 7,
+            Tier::High => 5,
+            Tier::Lossless => 2,
+        }
+    }
+    pub fn x264_preset(self) -> &'static str {
+        match self {
+            Tier::Fastest => "ultrafast",
+            Tier::Balanced => "veryfast",
+            Tier::High => "medium",
+            Tier::Lossless => "ultrafast",
+        }
+    }
+    pub fn qsv_preset(self) -> &'static str {
+        match self {
+            Tier::Fastest => "veryfast",
+            Tier::Balanced => "fast",
+            Tier::High => "medium",
+            Tier::Lossless => "veryslow", // unreachable via validate_tier; defensive
+        }
+    }
+    pub fn nvenc_preset(self) -> &'static str {
+        match self {
+            Tier::Fastest => "p1",
+            Tier::Balanced => "p4",
+            Tier::High => "p7",
+            Tier::Lossless => "p7", // unreachable via validate_tier; defensive
+        }
+    }
+    pub fn amf_quality(self) -> &'static str {
+        match self {
+            Tier::Fastest => "speed",
+            Tier::Balanced => "balanced",
+            Tier::High => "quality",
+            Tier::Lossless => "quality", // unreachable via validate_tier; defensive
         }
     }
 }
 
-/// Default preset for THIS machine: Quick Sync (or 8+ threads) handles the
-/// YouTube preset; weak software-only PCs fall back to Smooth (VP8).
-pub fn auto_quality() -> Quality {
-    let n = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    if qsv_available() || n > 4 {
-        Quality::Youtube
+/// Default tier from capabilities: hardware H.264 (or plenty of threads for
+/// software x264) gets Balanced; weak software-only machines get Fastest.
+pub fn default_tier(caps: &Capabilities) -> Tier {
+    let hw = caps.h264.qsv || caps.h264.nvenc || caps.h264.amf;
+    if hw || caps.cpu_threads >= 8 {
+        Tier::Balanced
     } else {
-        Quality::Balanced
+        Tier::Fastest
     }
+}
+
+/// Reject tier+codec combinations with no lossless mode (lossless on a
+/// hardware encoder or VP8) at parse time. Returns the resolved ffmpeg
+/// encoder id plus the human reason, so callers don't probe twice.
+pub fn check_tier(codec: Codec, tier: Tier) -> Result<(&'static str, String)> {
+    let (enc, why) = video_encoder_verbose(codec)?;
+    if tier == Tier::Lossless && enc != "libx264" && enc != "libvpx-vp9" {
+        bail!(
+            "lossless tier needs a codec with a lossless mode ({enc} has none) — \
+             use --codec x264 or --codec vp9"
+        );
+    }
+    Ok((enc, why))
 }
 
 #[derive(Debug, Clone)]
@@ -218,8 +394,17 @@ pub struct RecordConfig {
     pub height: u32,
     pub source: Source,
     pub codec: Codec,
+    /// Resolved bitrate like `"12M"` (tier-derived unless overridden).
+    /// Ignored by lossless modes.
     pub bitrate: String,
+    /// libvpx speed 0(best)..8(fastest); tier-derived unless overridden.
+    /// Only affects VP8/VP9.
     pub cpu_used: u8,
+    /// Encoder tier (drives presets). Kept so the writer path and
+    /// `--benchmark` report the same settings the user picked.
+    pub tier: Tier,
+    pub container: Container,
+    pub audio_codec: AudioCodec,
     pub threads: u32,
     pub duration: Option<u64>,
     pub no_cursor: bool,
@@ -228,7 +413,8 @@ pub struct RecordConfig {
 
 /// Audio source. Note: per-app isolation needs Windows 11+; on Windows 10
 /// "System" hears everything playing — mute other apps for clean game audio.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum AudioMode {
     /// Everything you hear (game + all apps). Best for game videos.
     #[default]
@@ -399,23 +585,24 @@ pub fn describe_source(cfg: &RecordConfig) -> Result<String> {
 }
 
 /// Resolve the output path: bare filename => joined under `dir`; a path with a
-/// directory component or drive letter is used as-is. Forces the container
-/// the codec needs (`want_ext`: mp4 for H.264, webm for VP8/VP9), creates
-/// parent folders, and auto-increments (`name_001`) so recordings are never
-/// silently overwritten.
-pub fn resolve_output(output: &str, dir: &str, want_ext: &str) -> Result<String> {
+/// directory component or drive letter is used as-is. The extension must
+/// agree with `container` (or be absent, in which case it is appended):
+/// a conflicting extension is a parse-time error, never a silent rename.
+/// Parent folders are created, and collisions auto-increment (`name_001`)
+/// so recordings are never silently overwritten.
+pub fn resolve_output(output: &str, dir: &str, container: Container) -> Result<String> {
+    let want_ext = container.ext();
     let mut out = output.to_owned();
-    // Swap a mismatched container extension (gameplay.webm + H.264 => .mp4);
-    // append only when there is no usable extension at all.
     let lower = out.to_lowercase();
-    let has_container_ext = lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".mkv");
-    if has_container_ext {
-        if let Some(dot) = out.rfind('.') {
-            out.truncate(dot);
+    const KNOWN: [&str; 3] = ["webm", "mp4", "mkv"];
+    if let Some(got) = KNOWN.iter().find(|e| lower.ends_with(&format!(".{e}"))) {
+        if *got != want_ext {
+            bail!(
+                "output ends with .{got} but the {want_ext} container needs .{want_ext} — \
+                 rename the file or pass --container {got}"
+            );
         }
-        out.push('.');
-        out.push_str(want_ext);
-    } else if !lower.ends_with(&format!(".{want_ext}")) {
+    } else {
         out.push('.');
         out.push_str(want_ext);
     }
@@ -514,6 +701,9 @@ struct PipeFlags {
     preview: Option<Sender<PreviewFrame>>,
     out_w: u32,
     out_h: u32,
+    /// Initial scratch capacity (bytes) for the de-padding buffer, derived
+    /// from the detected display / target resolution — not a fixed 1080p.
+    scratch_hint: usize,
     stop: Arc<AtomicBool>,
     captured: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
@@ -553,7 +743,7 @@ impl GraphicsCaptureApiHandler for Recorder {
             dropped: f.dropped,
             deadline: f.deadline,
             last_preview: Instant::now() - Duration::from_secs(1),
-            nopad: Vec::with_capacity(1920 * 1080 * 4),
+            nopad: Vec::with_capacity(f.scratch_hint),
             fitted: vec![0u8; px],
         })
     }
@@ -602,7 +792,9 @@ impl GraphicsCaptureApiHandler for Recorder {
             }
         }
         // Never block the capture thread (blocks = lag + RAM growth).
-        // Channel depth 2 keeps RAM flat; drops = realtime pacing, like OBS.
+        // Bounded channel keeps RAM flat; drops = realtime pacing, like OBS.
+        // (Depth is 3: absorbs the ~1 s encoder spin-up burst at record
+        // start; steady state still can't balloon.)
         match self.tx.try_send(std::mem::replace(
             &mut self.fitted,
             vec![0u8; (self.out_w as usize) * (self.out_h as usize) * 4],
@@ -652,94 +844,6 @@ fn fit_frame_center(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u
     }
 }
 
-// ---------- ffmpeg ----------
-
-/// Spawn ffmpeg. `audio` is Some((sample_rate, tcp_port)) unless Off —
-/// video comes over stdin, audio over loopback TCP, muxed to one WebM.
-fn spawn_ffmpeg(
-    cfg: &RecordConfig,
-    audio: Option<(u32, u16)>,
-) -> Result<ffmpeg_sidecar::child::FfmpegChild> {
-    let _ = ffmpeg_sidecar::download::auto_download().context("ffmpeg auto-download failed");
-
-    let enc: &str = video_encoder(cfg.codec)?;
-    // Realtime-tuned encoder args: lowest-latency path that still looks good.
-    // cpu-used 8 = fastest software (lowest CPU). H.264 prefers hardware
-    // (QSV/NVENC/AMF), else libx264 veryfast+zerolatency.
-    let extra: Vec<String> = match cfg.codec {
-        Codec::Vp8 => vec![
-            "-b:v".into(),
-            cfg.bitrate.clone(),
-            "-deadline".into(),
-            "realtime".into(),
-            "-cpu-used".into(),
-            cfg.cpu_used.clamp(0, 8).to_string(),
-            "-lag-in-frames".into(),
-            "16".into(),
-            "-auto-alt-ref".into(),
-            "1".into(),
-            "-g".into(),
-            (cfg.fps * 2).to_string(),
-        ],
-        Codec::Vp9 => vec![
-            "-b:v".into(),
-            cfg.bitrate.clone(),
-            "-deadline".into(),
-            "realtime".into(),
-            "-cpu-used".into(),
-            cfg.cpu_used.clamp(0, 8).to_string(),
-            "-row-mt".into(),
-            "1".into(),
-            "-tile-columns".into(),
-            "2".into(),
-            "-tile-rows".into(),
-            "1".into(),
-            // zero lookahead: lowest CPU + lowest latency. Bits (16M) carry
-            // the quality instead — the right trade for live game capture.
-            "-lag-in-frames".into(),
-            "0".into(),
-            "-auto-alt-ref".into(),
-            "1".into(),
-            "-g".into(),
-            (cfg.fps * 2).to_string(),
-        ],
-        Codec::H264 | Codec::H264Qsv | Codec::H264Nvenc | Codec::H264Amf => {
-            let kbps = bitrate_kbps(&cfg.bitrate);
-            let mut v = vec![
-                "-b:v".into(),
-                format!("{kbps}k"),
-                "-maxrate".into(),
-                format!("{}k", kbps * 3 / 2),
-                "-bufsize".into(),
-                format!("{}k", kbps * 2),
-                "-g".into(),
-                (cfg.fps * 2).to_string(),
-            ];
-            match enc {
-                "h264_qsv" => v.extend([
-                    "-preset".into(),
-                    "veryfast".into(),
-                    "-look_ahead".into(),
-                    "0".into(),
-                ]),
-                "h264_nvenc" => v.extend([
-                    "-preset".into(),
-                    "p4".into(),
-                    "-tune".into(),
-                    "ll".into(),
-                ]),
-                "h264_amf" => v.extend(["-quality".into(), "speed".into()]),
-                _ => v.extend([
-                    "-preset".into(),
-                    "veryfast".into(),
-                    "-tune".into(),
-                    "zerolatency".into(),
-                ]),
-            }
-            v
-        }
-    };
-
 /// "12M" / "8000k" / "8000000" -> kilobits per second (for maxrate/bufsize).
 fn bitrate_kbps(s: &str) -> u64 {
     let t = s.trim().to_lowercase();
@@ -752,6 +856,168 @@ fn bitrate_kbps(s: &str) -> u64 {
     };
     kbps.max(500.0) as u64
 }
+
+/// Realtime-tuned encoder args for one concrete ffmpeg encoder id.
+/// Shared by the recorder and `--benchmark` so both use identical settings.
+/// Tier drives presets/speed; `bitrate` is the resolved `"12M"`-style target
+/// (ignored by lossless modes); `cpu_used` only affects VP8/VP9.
+pub(crate) fn encoder_args(
+    enc: &str,
+    tier: Tier,
+    bitrate: &str,
+    cpu_used: u8,
+    fps: u32,
+) -> Vec<String> {
+    let gop = (fps.max(1) * 2).to_string();
+    let cpu = cpu_used.clamp(0, 8).to_string();
+    // CBR-ish bitrate trio shared by all lossy paths.
+    let trio = vec![
+        "-b:v".to_owned(),
+        format!("{}k", bitrate_kbps(bitrate)),
+        "-maxrate".to_owned(),
+        format!("{}k", bitrate_kbps(bitrate) * 3 / 2),
+        "-bufsize".to_owned(),
+        format!("{}k", bitrate_kbps(bitrate) * 2),
+    ];
+    let mut v = Vec::new();
+    match enc {
+        "libvpx" => {
+            v.extend(trio);
+            v.extend([
+                "-deadline".into(),
+                "realtime".into(),
+                "-cpu-used".into(),
+                cpu,
+                "-lag-in-frames".into(),
+                "16".into(),
+                "-auto-alt-ref".into(),
+                "1".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        "libvpx-vp9" if tier == Tier::Lossless => {
+            // True lossless VP9. Exact at any speed; cpu speed only sets pace.
+            v.extend([
+                "-lossless".into(),
+                "1".into(),
+                "-b:v".into(),
+                "0".into(),
+                "-cpu-used".into(),
+                cpu,
+                "-row-mt".into(),
+                "1".into(),
+                "-tile-columns".into(),
+                "2".into(),
+                "-tile-rows".into(),
+                "1".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        "libvpx-vp9" => {
+            v.extend(trio);
+            v.extend([
+                "-deadline".into(),
+                "realtime".into(),
+                "-cpu-used".into(),
+                cpu,
+                "-row-mt".into(),
+                "1".into(),
+                "-tile-columns".into(),
+                "2".into(),
+                "-tile-rows".into(),
+                "1".into(),
+                // zero lookahead: lowest CPU + lowest latency; the bitrate
+                // carries the quality instead — right trade for live capture.
+                "-lag-in-frames".into(),
+                "0".into(),
+                "-auto-alt-ref".into(),
+                "1".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        "libx264" if tier == Tier::Lossless => {
+            v.extend([
+                "-crf".into(),
+                "0".into(),
+                "-preset".into(),
+                "ultrafast".into(),
+                "-tune".into(),
+                "zerolatency".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        "libx264" => {
+            v.extend(trio);
+            v.extend([
+                "-preset".into(),
+                tier.x264_preset().into(),
+                "-tune".into(),
+                "zerolatency".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        // H.264 Quick Sync: the long-verified path, incl. no-lookahead.
+        "h264_qsv" => {
+            v.extend(trio);
+            v.extend([
+                "-preset".into(),
+                tier.qsv_preset().into(),
+                "-look_ahead".into(),
+                "0".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        // HEVC/AV1 hardware: minimal verified-shape flags only. Extra
+        // per-encoder options are deliberately NOT passed here — an
+        // unsupported option kills ffmpeg, and these paths can't all be
+        // tested on one machine (see TESTING.md).
+        other if other.ends_with("_qsv") => {
+            v.extend(trio);
+            v.extend(["-preset".into(), tier.qsv_preset().into(), "-g".into(), gop]);
+        }
+        other if other.ends_with("_nvenc") => {
+            v.extend(trio);
+            v.extend([
+                "-preset".into(),
+                tier.nvenc_preset().into(),
+                "-tune".into(),
+                "ll".into(),
+                "-g".into(),
+                gop,
+            ]);
+        }
+        other if other.ends_with("_amf") => {
+            v.extend(trio);
+            v.extend(["-quality".into(), tier.amf_quality().into(), "-g".into(), gop]);
+        }
+        _ => {
+            // Defensive: an unknown future encoder still gets paced output.
+            v.extend(trio);
+            v.extend(["-g".into(), gop]);
+        }
+    }
+    v
+}
+
+// ---------- ffmpeg ----------
+
+/// Spawn ffmpeg. `audio` is Some((sample_rate, tcp_port)) unless Off —
+/// video comes over stdin, audio over loopback TCP, muxed to one file.
+fn spawn_ffmpeg(
+    cfg: &RecordConfig,
+    audio: Option<(u32, u16)>,
+) -> Result<ffmpeg_sidecar::child::FfmpegChild> {
+    let _ = ffmpeg_sidecar::download::auto_download().context("ffmpeg auto-download failed");
+
+    let enc: &str = video_encoder(cfg.codec)?;
+    let extra: Vec<String> =
+        encoder_args(enc, cfg.tier, &cfg.bitrate, cfg.cpu_used, cfg.fps);
 
     let threads = if cfg.threads == 0 {
         std::thread::available_parallelism()
@@ -786,7 +1052,8 @@ fn bitrate_kbps(s: &str) -> u64 {
         "-",
     ]);
     if let Some((rate, port)) = audio {
-        // Game/mic sound: raw PCM over loopback TCP -> Opus in the same WebM.
+        // Game/mic sound: raw PCM over loopback TCP -> encoded audio
+        // (Opus or AAC depending on container) muxed into the same file.
         cmd.args([
             "-f",
             "s16le",
@@ -815,7 +1082,7 @@ fn bitrate_kbps(s: &str) -> u64 {
             "-map",
             "1:a:0",
             "-c:a",
-            "libopus",
+            cfg.audio_codec.ffmpeg_id(),
             "-b:a",
             "128k",
             "-ar",
@@ -824,6 +1091,22 @@ fn bitrate_kbps(s: &str) -> u64 {
     }
     for e in &extra {
         cmd.arg(e);
+    }
+    // Crash-safety (verified with kill tests, see TESTING.md):
+    // - MP4 is fragmented (empty moov + fragments at keyframes), so a file
+    //   killed mid-record stays playable up to the last keyframe instead of
+    //   losing everything to a missing moov atom.
+    // - MKV/WebM get 2 s bounded clusters for the same reason: a killed file
+    //   plays up to the last complete cluster. (This ffmpeg build has no
+    //   matroska/webm `live` muxer option; bounded clusters are the
+    //   equivalent mechanism here.)
+    match cfg.container {
+        Container::Mp4 => {
+            cmd.args(["-movflags", "frag_keyframe+empty_moov"]);
+        }
+        Container::Mkv | Container::Webm => {
+            cmd.args(["-cluster_time_limit", "2000"]);
+        }
     }
     // NOTE: no -vsync/-fps_mode flag on purpose. Our writer thread already
     // paces stdin at exactly CFR, and the vsync option was removed in recent
@@ -902,7 +1185,7 @@ fn writer_loop(
     }
 }
 
-// ---------- audio (system loopback + mic -> Opus) ----------
+// ---------- audio (system loopback + mic -> Opus/AAC) ----------
 
 /// Native sample rate for the audio feed. Loopback rate wins (Both/System),
 /// otherwise the mic rate — ffmpeg resamples to 48 kHz for Opus.
@@ -1246,12 +1529,23 @@ pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
     let capture = {
         let (stop, captured, dropped, error) =
             (stop.clone(), captured.clone(), dropped.clone(), error.clone());
+        // Scratch for the de-padding buffer: must fit the largest frame the
+        // source can deliver. Sources can't exceed the display, so size from
+        // the detected display (falling back to 1080p headless), floored
+        // against the target size in case detection failed low.
+        let out_px = cfg.width as usize * cfg.height as usize;
+        let disp_px = capabilities()
+            .primary_display
+            .map(|d| d.w as usize * d.h as usize)
+            .unwrap_or(1920 * 1080);
+        let scratch_hint = out_px.max(disp_px).saturating_mul(4).max(64 * 64 * 4);
         std::thread::spawn(move || {
             let flags = PipeFlags {
                 tx,
                 preview: ptx,
                 out_w: cfg.width,
                 out_h: cfg.height,
+                scratch_hint,
                 stop: stop.clone(),
                 captured,
                 dropped,
@@ -1353,7 +1647,7 @@ impl Session {
         let au = self.audio.as_ref().map(|h| h.is_finished()).unwrap_or(true);
         cap && wr && au
     }
-    /// Finalize the .webm and return any background error. Call after
+    /// Finalize the file and return any background error. Call after
     /// `request_stop()` or once `captures_done()` (duration reached / window
     /// closed). Never call from the capture thread itself.
     pub fn wait(mut self) -> Result<Snapshot> {
@@ -1373,5 +1667,114 @@ impl Session {
             anyhow::bail!("{e}");
         }
         Ok(self.snapshot())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_accepts_sane_combos() {
+        assert!(validate_matrix(Codec::H264, Container::Mp4, AudioCodec::Aac).is_ok());
+        assert!(validate_matrix(Codec::H265, Container::Mp4, AudioCodec::Aac).is_ok());
+        assert!(validate_matrix(Codec::Av1, Container::Mp4, AudioCodec::Aac).is_ok());
+        assert!(validate_matrix(Codec::Vp8, Container::Webm, AudioCodec::Opus).is_ok());
+        assert!(validate_matrix(Codec::Vp9, Container::Webm, AudioCodec::Opus).is_ok());
+        assert!(validate_matrix(Codec::Av1, Container::Webm, AudioCodec::Opus).is_ok());
+        assert!(validate_matrix(Codec::H264, Container::Mkv, AudioCodec::Opus).is_ok());
+        assert!(validate_matrix(Codec::Vp9, Container::Mkv, AudioCodec::Aac).is_ok());
+        assert!(validate_matrix(Codec::X264, Container::Mkv, AudioCodec::Opus).is_ok());
+    }
+
+    #[test]
+    fn matrix_rejects_bad_combos_with_guidance() {
+        // Opus is not allowed in MP4 (AAC it is).
+        let e = validate_matrix(Codec::H264, Container::Mp4, AudioCodec::Opus).unwrap_err();
+        assert!(e.to_string().contains("AAC"), "unexpected: {e}");
+        // H.264 can't go in WebM.
+        let e = validate_matrix(Codec::H264, Container::Webm, AudioCodec::Opus).unwrap_err();
+        assert!(e.to_string().contains("--container"), "unexpected: {e}");
+        // AAC can't go in WebM.
+        let e = validate_matrix(Codec::Vp9, Container::Webm, AudioCodec::Aac).unwrap_err();
+        assert!(e.to_string().contains("Opus"), "unexpected: {e}");
+        // VP8 can't go in MP4.
+        assert!(validate_matrix(Codec::Vp8, Container::Mp4, AudioCodec::Aac).is_err());
+    }
+
+    #[test]
+    fn tier_bitrate_scales_with_resolution() {
+        assert_eq!(Tier::Balanced.bitrate_for(1920, 1080), "10M");
+        assert_eq!(Tier::Fastest.bitrate_for(1920, 1080), "6M");
+        assert_eq!(Tier::High.bitrate_for(1920, 1080), "20M");
+        // 720p asks roughly half of 1080p.
+        assert_eq!(Tier::Balanced.bitrate_for(1280, 720), "4M");
+        // 4K high clamps at the 80M ceiling (20 * 4 = 80).
+        assert_eq!(Tier::High.bitrate_for(3840, 2160), "80M");
+        // Tiny inputs clamp to the 1M floor, never 0.
+        assert_eq!(Tier::Fastest.bitrate_for(64, 64), "1M");
+    }
+
+    #[test]
+    fn lossless_tier_needs_lossless_codec_hw_independent() {
+        // These hold on ANY machine: VP9/x264 resolve to software everywhere.
+        assert!(check_tier(Codec::Vp9, Tier::Lossless).is_ok());
+        assert!(check_tier(Codec::X264, Tier::Lossless).is_ok());
+        // VP8 has no lossless mode anywhere.
+        let e = check_tier(Codec::Vp8, Tier::Lossless).unwrap_err();
+        assert!(e.to_string().contains("x264"), "unexpected: {e}");
+    }
+
+    #[test]
+    fn encoder_args_shapes() {
+        // Lossless x264: CRF 0, no bitrate flags.
+        let a = encoder_args("libx264", Tier::Lossless, "10M", 8, 60);
+        assert!(a.contains(&"-crf".to_owned()) && a.contains(&"0".to_owned()));
+        assert!(!a.contains(&"-b:v".to_owned()));
+        // Lossy x264 balanced: veryfast preset + bitrate trio.
+        let a = encoder_args("libx264", Tier::Balanced, "10M", 8, 60);
+        assert!(a.contains(&"veryfast".to_owned()) && a.contains(&"-b:v".to_owned()));
+        // QSV balanced uses the fast preset with no lookahead.
+        let a = encoder_args("h264_qsv", Tier::Balanced, "10M", 8, 60);
+        assert!(a.contains(&"fast".to_owned()) && a.contains(&"-look_ahead".to_owned()));
+        // VP9 lossless carries the lossless flag.
+        let a = encoder_args("libvpx-vp9", Tier::Lossless, "0M", 2, 60);
+        assert!(a.contains(&"-lossless".to_owned()));
+        // Unknown future encoder still gets paced output, never garbage.
+        let a = encoder_args("mystery_hw", Tier::Balanced, "10M", 8, 30);
+        assert!(a.contains(&"-b:v".to_owned()) && a.contains(&"-g".to_owned()));
+        assert!(a.contains(&"60".to_owned())); // GOP = 2 x 30 fps
+    }
+
+    #[test]
+    fn output_rejects_conflicting_extension_before_touching_disk() {
+        // Conflicting extension bails before any directory is created.
+        let e =
+            resolve_output("clip.webm", "definitely-not-a-dir-xyz", Container::Mp4).unwrap_err();
+        assert!(e.to_string().contains("--container"), "unexpected: {e}");
+        assert!(
+            !std::path::Path::new("definitely-not-a-dir-xyz").exists(),
+            "must not create anything on validation failure"
+        );
+        // Matching extension passes; tested in a temp dir to avoid litter.
+        let tmp = std::env::temp_dir().join("crabby-test-output");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let p = resolve_output("clip.mp4", tmp.to_str().unwrap(), Container::Mp4).unwrap();
+        assert!(p.ends_with("clip.mp4"), "unexpected: {p}");
+        // Bare name gains the container extension.
+        let p2 = resolve_output("clip", tmp.to_str().unwrap(), Container::Mkv).unwrap();
+        assert!(p2.ends_with("clip.mkv"), "unexpected: {p2}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn container_audio_defaults_match_matrix() {
+        assert_eq!(Container::Mp4.default_audio(), AudioCodec::Aac);
+        assert_eq!(Container::Mkv.default_audio(), AudioCodec::Opus);
+        assert_eq!(Container::Webm.default_audio(), AudioCodec::Opus);
+        // The default never violates the matrix it came from.
+        for c in [Container::Mp4, Container::Mkv, Container::Webm] {
+            assert!(c.allows_audio(c.default_audio()));
+        }
     }
 }

@@ -1,128 +1,146 @@
-# Crabby — lightweight Rust game recorder (1080p60)
+# Crabby — hardware-adaptive screen recorder for Windows
 
-OBS-like capture for Windows, built in Rust. Records **monitor or specific window**
-to **WebM (VP8/VP9)** at **60fps 1080p**. Ships with a **modern native GUI**
-and a scriptable **CLI**, tuned for low CPU/RAM and YouTube-ready quality.
+OBS-like capture for Windows, built in Rust. Records **monitor or specific
+window** at up to **60 fps** with **hardware encoding when your machine has
+it** (Quick Sync, NVENC, AMF) and honest software fallbacks when it doesn't.
+Ships with a **native GUI** and a scriptable **CLI** that expose the same
+tiers, codecs and containers.
 
-## GUI or CLI
+On startup Crabby probes your actual hardware and picks sane defaults for
+it — the chosen encoder and the reason are printed at record start (paste
+that block into bug reports).
 
-```powershell
-cargo build --release
+## System requirements
 
-# modern interface (recommended)
-.\target\release\crabby.exe --gui
+- Windows 10 (1803+) or Windows 11, 64-bit x86_64.
+- Any CPU; 4 GB RAM minimum (8+ GB recommended for software encoding).
+- No GPU required — software x264/VP8/VP9 works everywhere. A hardware
+  encoder just makes it cheaper (see table).
+- ~150 MB free for the app + ffmpeg (auto-downloaded on first run).
 
-# headless / scripted
-.\target\release\crabby.exe --quality youtube --output gameplay.webm
-```
+## Encoder compatibility
 
-The GUI has a **live preview** (480p, 10 fps tap — what you see is what's
-saved), an **app picker dropdown** (monitor, or filterable window list with a
-green "Will record" confirmation — the recorder hides itself), audio + size
-dropdowns, save-folder browser, quality presets, and live stats (fps,
-captured, dropped). Finished videos appear in a **recordings library** with
-Play / Delete / Open-folder actions.
-It repaints at ~10 Hz while recording and idles at ~0% CPU otherwise.
-
-## Updates — no reinstall needed
-
-Crabby checks GitHub Releases for a newer version once a day in the
-background (plus a "Check for updates" button in the header showing the
-current version). When one drops you get an **Update available** badge with
-the release notes — one click downloads it and restarts straight into the
-new version. CLI works too:
-
-```powershell
-crabby --check-updates
-crabby --update
-```
-
-Maintainer (publishing): bump `version` in `Cargo.toml`, commit, then
-`git tag v1.1.0` + `git push --tags`. The release workflow builds
-`crabby.exe` and attaches it to the GitHub Release — installed copies pick
-it up on their next check.
-
-## Size: native app resolution, no black bars
-
-`--size native` (default) records at the source's own size — a 1440×759
-Notepad window saves as 1440×758, not stretched/padded to 1080p. Use
-`--size 1080p`, `720p`, or `WIDTHxHEIGHT` to force a frame (center crop/pad).
-
-## Audio: game sound + mic (Opus in the same WebM)
-
-`--audio system` (default) captures everything you hear via WASAPI loopback,
-`mic` captures the microphone, `both` mixes them, `off` is silent.
-Note: per-app-only audio needs Windows 11+ — on Windows 10, mute other apps
-(browser, music) while recording a game window for clean audio.
-
-## Your machine vs requirements
-
-| Part | You | Verdict |
+| Encoder | Needs | Expected tier |
 |---|---|---|
-| CPU i5-4570 (4C/4T Haswell) | Quick Sync H.264 in hardware | ~low single-digit % CPU recording |
-| RAM 16 GB | plenty | recorder uses ~60–120 MB (3-frame queue) |
-| Display 1920×1080 @100Hz | exact match | **zero scaler cost** |
-| Disk 37 GB free | fine | ~120 MB/min at 16M bitrate |
-| GPU HD 4600 | WGC capture is GPU-composited | near-zero capture overhead |
+| Quick Sync H.264 | Intel iGPU (2012+) + driver | balanced/high at 1080p60, low CPU |
+| NVENC H.264 | NVIDIA Kepler+ GPU + driver | balanced/high, near-zero CPU |
+| AMF H.264 | AMD GCN+ GPU + driver | balanced/high, near-zero CPU |
+| x264 software | any x86_64 | balanced on 8+ threads, fastest below |
+| Quick Sync / NVENC / AMF HEVC | Intel 6th-gen+ / Maxwell+ / Polaris+ | high, low CPU |
+| Quick Sync / NVENC / AMF AV1 | recent Intel / NVIDIA / AMD + driver | high, low CPU |
+| VP8 / VP9 software | any x86_64 | fastest/balanced; VP9 is heavy |
 
-## Quality: hardware H.264 for YouTube, VP8/VP9 WebM when you want it
+HEVC and AV1 have **no software fallback** (software AV1/HEVC at 60 fps is
+a slideshow) — on machines without the hardware they fail with a message
+saying what to use instead. See `TESTING.md` for what was verified on real
+hardware vs what follows from API docs.
 
-- `--quality youtube` (default on Quick Sync PCs): **H.264 MP4 @ 12M** —
-  Intel Quick Sync encodes in hardware (single-digit CPU), and H.264 MP4 is
-  YouTube's preferred upload format. Falls back to libx264 if no QSV driver.
-- `--quality smooth`: **VP8 WebM @ 8M**, pure software, lowest CPU.
-- `--codec h264` (auto: QSV → NVENC → AMF → x264), `h264-qsv`, `h264-nvenc`,
-  `h264-amf`, `vp8`, `vp9` — forced vendor options fail fast with a clear
-  message when their GPU is missing, and never leave empty files behind.
-- `--bitrate`, `--cpu-used` override the preset.
-- Fast-motion games need bits: 12M H.264 or 10–12M VP8.
-- If drops climb: close background apps or `--fps 30`.
+## Windows 10 vs 11 (unchanged, still true)
 
-## Local games (e.g. Modern Warships)
+- **Border capture:** Windows 10 rejects explicit border toggling, so the
+  app always uses the default. Windows 11 supports border on/off.
+- **Per-app audio:** needs Windows 11+. On Windows 10, system capture hears
+  everything playing — mute other apps for clean recordings.
+- **Exclusive fullscreen** can't be captured (same limit as OBS display
+  capture) — run games borderless-windowed.
 
-- Run the game in **borderless windowed** mode if fullscreen capture is black
-  (WGC can't see exclusive fullscreen — same limit as OBS display capture).
-- Window-only (clean, like OBS Game Capture):
-  `crabby --window "Modern Warships" --quality youtube`
-- Whole screen: `crabby --monitor 1 --quality youtube`
-- 10-second test: `--window "Modern Warships" --duration 10 --output test.webm`
+## Quality tiers
+
+Vendor-neutral, describe encode effort vs quality. Bitrates scale with
+resolution (shown: 1080p60 reference).
+
+| Tier | 1080p bitrate | Best on |
+|---|---|---|
+| `fastest` | ~6M | weak hardware, commentary drafts |
+| `balanced` (default) | ~10M | everything else |
+| `high-quality` | ~20M | machines with encode headroom |
+| `lossless` | exact pixels, huge files | x264 or VP9 only (HW encoders + VP8 rejected with guidance) |
+
+`--bitrate` and `--cpu-used` override the tier for power users; they don't
+replace it. Run `crabby --benchmark` to see which encoders hold realtime on
+your machine, then pick a tier.
+
+## Containers, codecs, crash-safety
+
+| Container | Video | Audio | If killed mid-record |
+|---|---|---|---|
+| MP4 (default) | H.264, H.265, AV1 | AAC | playable (fragmented MP4) |
+| MKV | anything | Opus or AAC | playable up to last 2 s cluster |
+| WebM | VP8, VP9, AV1 | Opus | playable up to last 2 s cluster |
+
+Invalid combinations (`--codec vp8` into MP4, Opus into MP4, …) are rejected
+at startup with a message telling you the fix — files are never silently
+renamed.
 
 ## Usage
 
 ```powershell
-# recordings land in D:\Recordings by default (auto-created, never overwritten —
-# existing names get _001, _002…)
-crabby --output gameplay.webm             # => D:\Recordings\gameplay.webm
-crabby --dir "D:\Videos" --output game.webm
-crabby --output "D:\Clips\warships.webm"  # full path bypasses --dir
+cargo build --release
 
-# list targets
-crabby --list-monitors
-crabby --list-windows
+# GUI (recommended) — also what a plain double-click opens
+.\target\release\crabby.exe --gui
 
-# overrides / fallbacks
-crabby --codec vp8 --bitrate 10M --output light.webm
-crabby --fps 30 --output light30.webm
-crabby --no-cursor --output clean.webm
+# CLI: record primary monitor until Enter/Ctrl+C (Videos folder)
+.\target\release\crabby.exe
+
+# window capture, 10-second test
+.\target\release\crabby.exe --window "Notepad" --duration 10 --output test
+
+# tiers, containers, overrides
+.\target\release\crabby.exe --quality high-quality --container mkv
+.\target\release\crabby.exe --codec vp9 --bitrate 12M --output draft
+.\target\release\crabby.exe --codec h265 --container mp4
+
+# what can I capture / how fast is my hardware
+.\target\release\crabby.exe --list-monitors
+.\target\release\crabby.exe --list-windows
+.\target\release\crabby.exe --benchmark
+
+# updates without reinstalling
+.\target\release\crabby.exe --check-updates
+.\target\release\crabby.exe --update
 ```
 
-Stop with **Enter** or **Ctrl+C** — the `.webm` is finalized cleanly.
-`--border` is accepted but needs Windows 11; on Windows 10 it's ignored.
+Stop with **Enter** or **Ctrl+C**. Finished files never overwrite: existing
+names get `_001`, `_002`, … `--border` is accepted but needs Windows 11.
+
+## Config file
+
+Optional TOML so you don't repeat flags. Default location
+`%APPDATA%\Crabby\config.toml` (`--config <path>` overrides).
+Precedence: **CLI flag > config file > built-in default**.
+
+```toml
+dir = "D:/Videos/Crabby"
+quality = "balanced"     # fastest | balanced | high-quality | lossless
+codec = "h264"           # h264 | h264-qsv | h264-nvenc | h264-amf | x264 | h265 | av1 | vp8 | vp9
+container = "mp4"        # mp4 | mkv | webm
+audio = "system"         # system | mic | both | off
+audio_codec = "aac"      # opus | aac (must fit the container)
+threads = 8              # omit = auto (CPU count)
+```
+
+## Updates
+
+Same as before: daily background check + header button in the GUI,
+`--check-updates` / `--update` in the CLI, releases published by pushing a
+`v*` tag. One known limitation: the updater stages the new exe **next to
+the running one**, so if you install Crabby under `C:\Program Files` (not
+writable without elevation) the update will fail with a clear message —
+install it somewhere user-writable instead. No redesign planned; it works
+for the portable-zip distribution this project ships.
 
 ## How it stays light
 
-- Windows Graphics Capture API (GPU-composited, event-driven — idle screen ≈ 0% CPU)
-- Intel Quick Sync H.264 hardware encode (or fastest-possible software VP8/VP9)
-- Fixed-size pipe, center crop/pad in-Rust (cheap memcpy, no scaler)
-- Bounded 3-frame channel + `try_send` (never blocks capture; drops = realtime, like OBS)
-- Buffer reuse (no per-frame alloc), CFR pacer thread, realtime libvpx flags
-- FFmpeg auto-downloaded on first run (no manual install needed)
-- Zero `unsafe`, no unwraps on hot paths, all numeric inputs clamped
+- Windows Graphics Capture (GPU-composited, event-driven — idle ≈ 0% CPU)
+- Hardware encode when present, fastest-sane software settings otherwise
+- Bounded channel + `try_send` (never blocks capture; drops = realtime)
+- Buffer reuse, CFR pacer thread, reused scratch sized from your display
+- Zero `unsafe` in our code, no unwraps on hot/user/hardware paths
 
 ## Branding
 
-`assets/crabby.png` is the master logo. `assets/icon-<N>.png`
-are high-quality sizes regenerated from it; `build.rs` packs them into a
-multi-image `icon.ico` at build time and embeds it in the exe (taskbar,
-Alt-Tab, shortcuts) with version info + a DPI-aware manifest, while the
-GUI sets the same art as its window icon at runtime.
+`assets/crabby.png` is the master logo. `assets/icon-<N>.png` are
+high-quality sizes regenerated from it; `build.rs` packs them into a
+multi-image `icon.ico` and embeds version info + a DPI-aware manifest,
+while the GUI sets the same art as its window icon at runtime.
