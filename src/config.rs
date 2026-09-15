@@ -12,6 +12,7 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
 use crate::recorder::{AudioCodec, AudioMode, Codec, Container, Tier};
+use crate::shot::ShotFormat;
 
 /// Flat TOML keys, all optional. Unknown keys are rejected to catch typos.
 ///
@@ -23,6 +24,9 @@ use crate::recorder::{AudioCodec, AudioMode, Codec, Container, Tier};
 /// audio = "system"          # system | mic | both | off
 /// audio_codec = "aac"       # opus | aac (must fit the container)
 /// threads = 8               # omit = auto (CPU count)
+/// shot_format = "png"       # png | webp | jpg | bmp (screenshot files)
+/// shot_dir = "D:/Pics/Shots" # omit = Pictures/Crabby
+/// shot_hotkeys = true       # global keys (Win+PrtSc etc.); omit = on
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +38,11 @@ pub struct FileConfig {
     pub audio: Option<AudioMode>,
     pub audio_codec: Option<AudioCodec>,
     pub threads: Option<u32>,
+    pub shot_format: Option<ShotFormat>,
+    pub shot_dir: Option<String>,
+    /// Global screenshot hotkeys (Win+PrtSc fullscreen, PrtSc region,
+    /// Alt+PrtSc window). Default on; set false if another tool owns the keys.
+    pub shot_hotkeys: Option<bool>,
 }
 
 /// Where the default config lives.

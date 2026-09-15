@@ -11,6 +11,7 @@ mod caps;
 mod config;
 mod gui;
 mod recorder;
+mod shot;
 mod updater;
 
 use std::io::{IsTerminal as _, Read};
@@ -137,6 +138,36 @@ struct Args {
     /// Internal: passed by the updater on restart after a successful update
     #[arg(long, hide = true)]
     updated_from: Option<String>,
+
+    /// Take a screenshot and exit (Snipping-Tool style, no recording)
+    #[arg(long, default_value_t = false)]
+    screenshot: bool,
+
+    /// Screenshot mode: fullscreen, window, or region
+    #[arg(long, value_enum)]
+    shot_mode: Option<shot::ShotMode>,
+
+    /// Region for `--shot-mode region`, as WxH+X+Y in physical pixels
+    /// (e.g. 800x600+100+200)
+    #[arg(long)]
+    shot_region: Option<String>,
+
+    /// Screenshot file format: png, webp, jpg, bmp
+    /// (default: config shot_format, else png)
+    #[arg(long, value_enum)]
+    shot_format: Option<shot::ShotFormat>,
+
+    /// Screenshot output: bare name (saved in the shot folder) or full path
+    #[arg(long)]
+    shot_output: Option<String>,
+
+    /// Screenshot save folder (default: Pictures/Crabby, or config shot_dir)
+    #[arg(long)]
+    shot_dir: Option<String>,
+
+    /// Skip copying the screenshot to the clipboard
+    #[arg(long, default_value_t = false)]
+    shot_no_copy: bool,
 }
 
 impl Args {
@@ -164,10 +195,17 @@ impl Args {
             && !self.no_cursor
             && !self.border
             && self.config.is_none()
-            && !self.benchmark
-            && !self.check_updates
-            && !self.update
-            && self.updated_from.is_none()
+        && !self.benchmark
+        && !self.check_updates
+        && !self.update
+        && self.updated_from.is_none()
+        && !self.screenshot
+        && self.shot_mode.is_none()
+        && self.shot_region.is_none()
+        && self.shot_format.is_none()
+        && self.shot_output.is_none()
+        && self.shot_dir.is_none()
+        && !self.shot_no_copy
     }
 }
 
@@ -209,10 +247,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Config first: the screenshot path needs it too (shot dir + format).
+    let file_cfg: FileConfig = config::load(args.config.as_deref())?;
+    if args.screenshot || args.shot_mode.is_some() {
+        return run_screenshot(&args, &file_cfg);
+    }
+
     // Resolve effective settings: CLI flag > config file > built-in default.
     // All validation happens here, before any capture starts.
     let caps = capabilities();
-    let file_cfg: FileConfig = config::load(args.config.as_deref())?;
     let dir = args
         .dir
         .or(file_cfg.dir)
@@ -289,6 +332,14 @@ fn main() -> Result<()> {
     if enc_id.starts_with("lib") {
         println!("note       |  software encode; if frames drop, step down a tier or use --fps 30.");
     }
+    // Perf pre-flight (advisory on CLI — scripts/automation unaffected).
+    {
+        use recorder::{PerfLevel, check_perf};
+        let v = check_perf(enc_id, tier, cpu_used, width, height, fps, threads);
+        if v.level != PerfLevel::Ok {
+            eprintln!("perf       |  {} — try --size 720p --fps 30 --quality fastest", v.message);
+        }
+    }
 
     let session = start_session(cfg, false)?;
     println!("recording |  {}  (Enter or Ctrl+C to stop)", session.output());
@@ -325,11 +376,21 @@ fn main() -> Result<()> {
         last_w = s.written;
     }
     let out_path = session.output().to_owned();
+    // Read before `wait()` consumes the session; stall warnings accumulate
+    // during the run, so a pre-finalize read already holds the signal.
+    let ffmpeg_tail = session.ffmpeg_tail(3);
     match session.wait() {
-        Ok(s) => println!(
-            "done      |  saved (captured={} dropped={} written={}; drops = realtime pacing, normal)",
-            s.captured, s.dropped, s.written,
-        ),
+        Ok(s) => {
+            println!(
+                "done      |  saved (captured={} dropped={} written={}; drops = realtime pacing, normal)",
+                s.captured, s.dropped, s.written,
+            );
+            if s.dropped > 0 && s.dropped * 20 > s.captured.max(1) {
+                if let Some(last) = ffmpeg_tail.last() {
+                    println!("ffmpeg     |  {last}");
+                }
+            }
+        }
         Err(e) => {
             // Don't leave a useless 0-byte file behind on encoder failure.
             if std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(u64::MAX) < 4096 {
@@ -371,6 +432,61 @@ fn update_cli() -> Result<()> {    println!("crabby v{} — checking for updates
     })?;
     println!("installing + restarting…");
     updater::install_and_restart(&staged)
+}
+
+/// `--screenshot`: single-frame capture, no ffmpeg involved (fast by design).
+/// Mode defaults to fullscreen; `--window` picks the window, `--shot-region`
+/// crops the monitor. Saves to the shot folder (or `--shot-output`) and
+/// copies to the clipboard unless `--shot-no-copy`.
+fn run_screenshot(args: &Args, file_cfg: &FileConfig) -> Result<()> {
+    use shot::{ShotMode, capture_monitor, capture_window, crop, parse_region};
+
+    let format = args.shot_format.or(file_cfg.shot_format).unwrap_or_default();
+    let dir = args
+        .shot_dir
+        .clone()
+        .or_else(|| file_cfg.shot_dir.clone())
+        .unwrap_or_else(shot::screenshot_dir);
+    let mode = args.shot_mode.unwrap_or(ShotMode::Fullscreen);
+
+    let img = match mode {
+        ShotMode::Fullscreen => capture_monitor(args.monitor)?,
+        ShotMode::Window => {
+            let Some(needle) = args.window.clone() else {
+                anyhow::bail!("--shot-mode window needs --window <text> (match by title)");
+            };
+            capture_window(&needle)?
+        }
+        ShotMode::Region => {
+            let Some(region) = args.shot_region.clone() else {
+                anyhow::bail!("--shot-mode region needs --shot-region WxH+X+Y (e.g. 800x600+100+200)");
+            };
+            let (x, y, w, h) = parse_region(&region)?;
+            let full = capture_monitor(args.monitor)?;
+            crop(&full, x, y, w, h)?
+        }
+    };
+
+    // Save: explicit --shot-output may be a bare name or a full path.
+    let is_path = args
+        .shot_output
+        .as_deref()
+        .map(|o| o.contains('/') || o.contains('\\') || o.contains(':'))
+        .unwrap_or(false);
+    let saved = match (&args.shot_output, is_path) {
+        (Some(o), true) => shot::save_shot_to(&img, o, format)?,
+        (Some(o), false) => shot::save_shot(&img, &dir, Some(o), format)?,
+        (None, _) => shot::save_shot(&img, &dir, None, format)?,
+    };
+    if args.shot_no_copy {
+        println!("shot      |  saved {saved}");
+    } else {
+        match shot::copy_to_clipboard(&img) {
+            Ok(()) => println!("shot      |  saved {saved}  (copied to clipboard)"),
+            Err(e) => println!("shot      |  saved {saved}  (clipboard: {e:?})"),
+        }
+    }
+    Ok(())
 }
 
 /// `--benchmark`: synthetic 5 s encode per available encoder path at the

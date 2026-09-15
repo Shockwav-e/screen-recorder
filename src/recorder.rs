@@ -11,7 +11,8 @@
 //! Hardware specifics (which encoder, how many threads, what display) come
 //! from `crate::caps`, never from hardcoded machine assumptions.
 
-use std::io::Write as _;
+use std::collections::VecDeque;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -235,8 +236,112 @@ pub fn video_encoder_verbose(codec: Codec) -> Result<(&'static str, String)> {
 pub fn video_encoder(codec: Codec) -> Result<&'static str> {
     Ok(video_encoder_verbose(codec)?.0)
 }
+
+/// True for CPU encoders (throughput scales with core count). Hardware
+/// encoders are fixed-function and never the bottleneck at these sizes.
+pub fn encoder_is_software(enc: &str) -> bool {
+    matches!(enc, "libx264" | "libvpx" | "libvpx-vp9")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerfLevel {
+    /// Comfortable headroom — just record.
+    Ok,
+    /// Near the limit — expect some drops; 30 fps or a smaller size fixes it.
+    Tight,
+    /// Hopelessly over budget — the recording will be almost all drops.
+    TooHeavy,
+}
+
+pub struct PerfVerdict {
+    pub level: PerfLevel,
+    pub message: String,
+}
+
+/// Sustained software-encode budget in pixels/sec, scaled by thread count.
+/// Deliberately conservative: a false "tight" costs one extra click, a false
+/// "ok" costs a ruined recording. Machines with <= 4 threads get halved
+/// budgets — those cores are usually old/slow as well as few.
+fn software_budget_px_s(enc: &str, tier: Tier, cpu_used: u8, threads: u32) -> f64 {
+    let t = threads.max(1) as f64;
+    let per_thread_mpx = match enc {
+        "libx264" => match tier {
+            Tier::Fastest => 60.0,  // ultrafast
+            Tier::Balanced => 30.0, // veryfast
+            Tier::High => 15.0,     // medium
+            Tier::Lossless => 25.0, // ultrafast CRF 0 (slower than lossy)
+        },
+        "libvpx" => match tier {
+            Tier::Fastest => 30.0,
+            _ => 20.0,
+        },
+        "libvpx-vp9" => {
+            if tier == Tier::Lossless {
+                3.0
+            } else if cpu_used >= 7 {
+                12.0
+            } else if cpu_used >= 5 {
+                8.0
+            } else {
+                4.0
+            }
+        }
+        _ => return f64::INFINITY, // hardware or unknown — not our problem
+    };
+    let weak = if threads <= 4 { 0.5 } else { 1.0 };
+    per_thread_mpx * 1_000_000.0 * t * weak
+}
+
+/// Pre-flight estimate: can this encoder hold `w`x`h`@`fps` on this CPU?
+/// Pure heuristic — call before `start_session`, never on a hot path.
+pub fn check_perf(
+    enc: &str,
+    tier: Tier,
+    cpu_used: u8,
+    w: u32,
+    h: u32,
+    fps: u32,
+    threads: u32,
+) -> PerfVerdict {
+    if !encoder_is_software(enc) {
+        // (Display name lookup would borrow `enc`; the raw id is clear
+        // enough in a perf line.)
+        return PerfVerdict {
+            level: PerfLevel::Ok,
+            message: format!("hardware encode ({enc}) — throughput is not the bottleneck"),
+        };
+    }
+    let load = w as f64 * h.max(1) as f64 * fps.max(1) as f64;
+    let budget = software_budget_px_s(enc, tier, cpu_used, threads);
+    let ratio = load / budget;
+    let mode = format!("{}x{}@{}", w, h, fps.max(1));
+    let have = format!(
+        "{mode} needs ~{:.0} MP/s but {} manages ~{:.0} MP/s on {} threads",
+        load / 1_000_000.0,
+        encoder_display(enc),
+        budget / 1_000_000.0,
+        threads.max(1),
+    );
+    if ratio < 0.7 {
+        PerfVerdict { level: PerfLevel::Ok, message: have }
+    } else if ratio < 1.1 {
+        PerfVerdict {
+            level: PerfLevel::Tight,
+            message: format!(
+                "{have} — near the limit, expect dropped frames; 30 fps or 720p fixes it"
+            ),
+        }
+    } else {
+        PerfVerdict {
+            level: PerfLevel::TooHeavy,
+            message: format!(
+                "{have} — this will drop almost everything; use 720p + 30 fps + Fastest (or hardware H.264)"
+            ),
+        }
+    }
+}
 /// Short display name for a concrete encoder id.
-pub fn encoder_display(enc: &'static str) -> &'static str {
+pub fn encoder_display(enc: &str) -> &str {
     match enc {
         "h264_qsv" => "H.264-QuickSync",
         "h264_nvenc" => "H.264-NVENC",
@@ -695,6 +800,41 @@ fn lock_err(m: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<Strin
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// ffmpeg's stderr ring buffer (bounded — a stalling ffmpeg can spit a
+/// warning per frame, and an unread pipe would block ffmpeg itself).
+type FfmpegLog = Arc<Mutex<VecDeque<String>>>;
+
+/// How many stderr lines to keep (enough for the failure context, small
+/// enough to clone cheaply for status reads).
+const FFMPEG_LOG_KEEP: usize = 40;
+
+fn lock_log(m: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn push_log_line(log: &FfmpegLog, line: String) {
+    let mut g = lock_log(log);
+    if g.len() >= FFMPEG_LOG_KEEP {
+        g.pop_front();
+    }
+    g.push_back(line);
+}
+
+/// Drain ffmpeg's stderr to the ring buffer. MUST run for every spawned
+/// ffmpeg: the pipe is bounded, and a blocked-on-stderr ffmpeg looks exactly
+/// like a hung encoder (writer stalls → mass drops). Returns at EOF.
+fn ffmpeg_log_loop(stderr: Option<std::process::ChildStderr>, log: FfmpegLog) {
+    let Some(err) = stderr else { return };
+    for line in BufReader::new(err).lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim().to_owned();
+        if line.is_empty() {
+            continue;
+        }
+        push_log_line(&log, line);
+    }
+}
+
 #[derive(Clone)]
 struct PipeFlags {
     tx: Sender<Packet>,
@@ -1035,8 +1175,10 @@ fn spawn_ffmpeg(
     // (slight stepping) instead of fast-forwarding.
     cmd.args([
         "-hide_banner",
+        // `warning` (not `error`): stall signatures like "buffer queue
+        // overflow, dropping" are warnings, and the ring buffer bounds them.
         "-loglevel",
-        "error",
+        "warning",
         "-y",
         "-use_wallclock_as_timestamps",
         "1",
@@ -1126,6 +1268,7 @@ fn writer_loop(
     stop: Arc<AtomicBool>,
     written: Arc<AtomicU64>,
     error: Arc<Mutex<Option<String>>>,
+    ffmpeg_log: FfmpegLog,
 ) {
     let res: Result<()> = (|| {
         use std::io::Write as _;
@@ -1173,10 +1316,16 @@ fn writer_loop(
         }
         drop(stdin); // EOF -> ffmpeg finalizes the .webm/.mp4
         // Loud failure beats a silent empty file: a bad encoder (or dead
-        // ffmpeg) must surface, not produce 0-byte recordings.
+        // ffmpeg) must surface, not produce 0-byte recordings. The last
+        // stderr line usually names the cause (missing encoder, bad option).
         let status = child.wait().context("ffmpeg wait failed")?;
         if !status.success() {
-            anyhow::bail!("ffmpeg exited with {status} — encoder failed to start?");
+            let tail = lock_log(&ffmpeg_log).back().cloned().unwrap_or_default();
+            if tail.is_empty() {
+                anyhow::bail!("ffmpeg exited with {status} — encoder failed to start?");
+            } else {
+                anyhow::bail!("ffmpeg exited with {status} — {tail}");
+            }
         }
         Ok(())
     })();
@@ -1443,6 +1592,7 @@ pub struct Session {
     dropped: Arc<AtomicU64>,
     written: Arc<AtomicU64>,
     error: Arc<Mutex<Option<String>>>,
+    ffmpeg_log: FfmpegLog,
     output: String,
     started: Instant,
     capture: Option<JoinHandle<()>>,
@@ -1499,13 +1649,22 @@ pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
         AudioLink::On { listener, rate, mic_rate, port }
     };
 
-    let child = spawn_ffmpeg(
+    let mut child = spawn_ffmpeg(
         &cfg,
         match &audio_link {
             AudioLink::Off => None,
             AudioLink::On { rate, port, .. } => Some((*rate, *port)),
         },
     )?;
+
+    // Drain stderr FIRST (before any thread can block on a full pipe) —
+    // an unread stderr can deadlock ffmpeg mid-record, which surfaces as
+    // mass drops with a "successful" exit.
+    let ffmpeg_log: FfmpegLog = Arc::new(Mutex::new(VecDeque::new()));
+    {
+        let (stderr, log) = (child.take_stderr(), ffmpeg_log.clone());
+        std::thread::spawn(move || ffmpeg_log_loop(stderr, log));
+    }
 
     // audio thread owns the cpal streams + TCP socket
     let audio = match audio_link {
@@ -1520,9 +1679,15 @@ pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
 
     // writer thread owns ffmpeg
     let writer = {
-        let (rx, stop, written, error, cfg) =
-            (rx, stop.clone(), written.clone(), error.clone(), cfg.clone());
-        std::thread::spawn(move || writer_loop(rx, child, &cfg, stop, written, error))
+        let (rx, stop, written, error, log, cfg) = (
+            rx,
+            stop.clone(),
+            written.clone(),
+            error.clone(),
+            ffmpeg_log.clone(),
+            cfg.clone(),
+        );
+        std::thread::spawn(move || writer_loop(rx, child, &cfg, stop, written, error, log))
     };
 
     // capture thread owns the WGC session (Capture::start blocks)
@@ -1607,6 +1772,7 @@ pub fn start_session(cfg: RecordConfig, preview: bool) -> Result<Session> {
         dropped,
         written,
         error,
+        ffmpeg_log,
         output: cfg.output,
         started: Instant::now(),
         capture: Some(capture),
@@ -1640,6 +1806,18 @@ impl Session {
             written: self.written.load(Ordering::Relaxed),
         }
     }
+    /// Last `n` ffmpeg stderr lines (newest last). Cheap clone of a bounded
+    /// buffer — safe to call every second for status display.
+    pub fn ffmpeg_tail(&self, n: usize) -> Vec<String> {
+        lock_log(&self.ffmpeg_log)
+            .iter()
+            .rev()
+            .take(n.max(1))
+            .rev()
+            .cloned()
+            .collect()
+    }
+
     /// True once all background threads have exited (joinable without blocking).
     pub fn captures_done(&self) -> bool {
         let cap = self.capture.as_ref().map(|h| h.is_finished()).unwrap_or(true);
@@ -1663,8 +1841,15 @@ impl Session {
         if let Some(h) = self.writer.take() {
             let _ = h.join();
         }
+        // Joins done — the log is complete; attach it to failures so the
+        // cause (bad option, missing encoder, stall warnings) isn't lost.
+        let tail = self.ffmpeg_tail(8);
         if let Some(e) = lock_err(&self.error).take() {
-            anyhow::bail!("{e}");
+            if tail.is_empty() {
+                anyhow::bail!("{e}");
+            } else {
+                anyhow::bail!("{e}\nffmpeg said:\n{}", tail.join("\n"));
+            }
         }
         Ok(self.snapshot())
     }
@@ -1765,6 +1950,43 @@ mod tests {
         let p2 = resolve_output("clip", tmp.to_str().unwrap(), Container::Mkv).unwrap();
         assert!(p2.ends_with("clip.mkv"), "unexpected: {p2}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn perf_guard_ranks_sane_cases() {
+        use super::{PerfLevel, check_perf};
+        // 4-thread software x264 at 1080p60: the classic doomed recording.
+        let v = check_perf("libx264", Tier::Balanced, 8, 1920, 1080, 60, 4);
+        assert_eq!(v.level, PerfLevel::TooHeavy, "unexpected: {}", v.message);
+        // Same machine at 720p30: comfortable.
+        let v = check_perf("libx264", Tier::Fastest, 8, 1280, 720, 30, 4);
+        assert_eq!(v.level, PerfLevel::Ok, "unexpected: {}", v.message);
+        // 8-thread desktop holds 1080p60 x264 (tight or ok, never hopeless).
+        let v = check_perf("libx264", Tier::Balanced, 8, 1920, 1080, 60, 8);
+        assert!(v.level != PerfLevel::TooHeavy, "unexpected: {}", v.message);
+        // VP9 lossless anywhere near 1080p60 is hopeless.
+        let v = check_perf("libvpx-vp9", Tier::Lossless, 2, 1920, 1080, 60, 8);
+        assert_eq!(v.level, PerfLevel::TooHeavy, "unexpected: {}", v.message);
+        // Hardware encoders never trip the guard, even at 4K.
+        for enc in ["h264_qsv", "h264_nvenc", "h264_amf", "hevc_qsv"] {
+            let v = check_perf(enc, Tier::High, 8, 3840, 2160, 60, 4);
+            assert_eq!(v.level, PerfLevel::Ok, "unexpected for {enc}: {}", v.message);
+        }
+    }
+
+    #[test]
+    fn ffmpeg_log_ring_keeps_newest_and_caps() {
+        use super::{FFMPEG_LOG_KEEP, push_log_line};
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(VecDeque::new()));
+        for i in 0..FFMPEG_LOG_KEEP + 10 {
+            push_log_line(&log, format!("line {i}"));
+        }
+        let g = log.lock().unwrap();
+        assert_eq!(g.len(), FFMPEG_LOG_KEEP);
+        assert_eq!(g.front().unwrap(), "line 10");
+        assert_eq!(g.back().unwrap(), &format!("line {}", FFMPEG_LOG_KEEP + 9));
     }
 
     #[test]

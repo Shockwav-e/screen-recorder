@@ -104,6 +104,54 @@ cargo build --release
 Stop with **Enter** or **Ctrl+C**. Finished files never overwrite: existing
 names get `_001`, `_002`, … `--border` is accepted but needs Windows 11.
 
+## Dropping frames?
+
+`Saved clip.mp4 (26 frames, 951 dropped)` means capture ran full speed but
+the encoder only finished a few frames per second — the file is valid but
+nearly empty. The app now warns **before** a doomed recording (GUI blocks
+the first press; press Record again to override, or hit **Use safe 720p30
+Fastest**). Rules of thumb for software encode (no QSV/NVENC/AMF):
+
+| Machine | Holds | Avoid |
+|---|---|---|
+| 8+ threads | 1080p60 Balanced | 4K60, Lossless VP9 |
+| 4 threads | 720p30 Fastest | 1080p60, High/Lossless |
+| VP9, any tier | 720p30 | 1080p60 (needs ~2× the CPU of x264) |
+
+Fastest relief in order: **720p → 30 fps → Fastest tier → Auto H.264**
+(hardware when present). `crabby --benchmark` measures your encoders
+directly. Native size on a 1440p/4K display is the usual culprit — the pixel
+count, not the window content, is what the encoder chokes on.
+
+## Screenshots (Snipping-Tool style)
+
+Region (drag a rectangle, Esc cancels), Window (§1 pick) and Fullscreen
+(§1 monitor) — every capture auto-saves **and** copies to the clipboard,
+then pops a Windows-style notification at the screen's bottom-right:
+thumbnail (grows on hover), Open/Copy buttons, gone after 3 s unless
+hovered. The built-in editor does pen markup (6 colors, 2–24px) and crop.
+
+Keys (Crabby must be running for the global ones):
+
+| Keys | Action |
+|---|---|
+| `Win+PrtSc` | fullscreen screenshot, anywhere |
+| `PrtSc` | region snip, anywhere |
+| `Alt+PrtSc` | window snip, anywhere |
+| `Alt+N` / `Alt+W` / `Alt+F` | region / window / fullscreen (app focused) |
+| `Ctrl+S` / `Ctrl+C` / `Esc` | save / copy / close editor |
+
+`Win+PrtSc` needs no setup; if another tool owns a key the app says which
+ones are live in §5. Formats: PNG (default), WebP, JPG (fastest), BMP —
+pick in §5 or set `shot_format` / `shot_dir` in the config file
+(`shot_hotkeys = false` disables the global keys).
+
+```powershell
+.\target\release\crabby.exe --screenshot                                    # fullscreen
+.\target\release\crabby.exe --screenshot --shot-mode window --window Notepad # window
+.\target\release\crabby.exe --screenshot --shot-mode region --shot-region 800x600+100+200 --shot-format webp
+```
+
 ## Config file
 
 Optional TOML so you don't repeat flags. Default location

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- Perf pre-flight guard (`check_perf`): software-encoder throughput is
+  estimated from resolution × fps × threads before recording. The GUI warns
+  and asks for a second Record press on doomed settings, with a one-click
+  **Use safe 720p30 Fastest** escape hatch; the CLI prints an advisory
+  `perf` line. Fixes silent 97%-drop recordings (e.g. software x264 at
+  native 60 fps on 4-thread machines).
+- Screenshots, Snipping-Tool style: Region/Window/Fullscreen capture
+  (§5 panel + `--screenshot` CLI), auto-save + clipboard, basic pen + crop
+  editor, and a desktop popup at the screen's bottom-right (thumbnail with
+  hover-grow, Open/Copy, 3 s unless hovered).
+- Screenshot hotkeys: global Win+PrtSc / PrtSc / Alt+PrtSc (config
+  `shot_hotkeys = false` opts out) plus in-app Alt+N/W/F, Ctrl+S/C, Esc.
+- Screenshot formats: PNG (default), WebP, JPG, BMP — GUI dropdown plus
+  `shot_format` config key and `--shot-format` CLI flag.
+- Screenshot settings: `shot_dir` config key, `%VAR%`/`$VAR` expansion in
+  screenshot paths.
+- Fixed `cmd.exe` console windows flashing on updater restart and on
+  Play/open-file (CREATE_NO_WINDOW + `start /B`).
+- ffmpeg stderr is now drained into a bounded ring buffer (an unread pipe
+  could deadlock ffmpeg mid-record, surfacing as mass drops) and surfaced:
+  last lines on failure, live line under the dropping-frames warning, tail
+  on the saved message. `-loglevel` raised to `warning` to catch stall
+  signatures like buffer-queue overflows.
+
 ## 2.0.0 — hardware-adaptive public release
 
 **Breaking CLI changes** (no deprecation shims — 2.0.0 is the cleanup release):

@@ -12,17 +12,21 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as _;
+
 use anyhow::Result;
 use eframe::egui;
 
 use crate::caps::capabilities;
 use crate::config::{self, default_video_dir};
 use crate::recorder::{
-    AudioCodec, AudioMode, Codec, Container, RecordConfig, Snapshot, Source, Session, Tier,
-    check_tier, default_tier, describe_source, encoder_display, list_monitors, list_windows,
-    resolve_output, resolve_size, start_session, validate_matrix,
+    AudioCodec, AudioMode, Codec, Container, PerfLevel, RecordConfig, Snapshot, Source, Session,
+    Tier, check_perf, check_tier, default_tier, describe_source, encoder_display, list_monitors,
+    list_windows, resolve_output, resolve_size, start_session, validate_matrix,
     MonitorInfo, WindowInfo,
 };
+use crate::shot::{self, Shot, ShotFormat, ShotMode};
 use crate::updater;
 
 /// Index 0 = follow the tier; the rest override it (power users).
@@ -171,6 +175,117 @@ impl UpdateUi {
 struct StopOutcome {
     output: String,
     result: std::result::Result<Snapshot, String>,
+    /// Last ffmpeg stderr lines (read before `wait()` consumes the session).
+    ffmpeg_tail: Vec<String>,
+}
+
+/// In-progress screenshot editor (basic pen + crop, Snipping-Tool style).
+struct ShotEdit {
+    shot: Shot,
+    tex: Option<egui::TextureHandle>,
+    pen: usize,
+    pen_size: f32,
+    crop_mode: bool,
+    /// Drag rect in image pixels (set while dragging in crop mode).
+    crop_rect: Option<egui::Rect>,
+    /// Drag anchor in image pixels.
+    drag_start: Option<egui::Pos2>,
+    /// In-progress pen stroke in image pixels (drawn as overlay, committed
+    /// to pixels on release — one texture upload per stroke, not per move).
+    cur_stroke: Vec<egui::Pos2>,
+}
+
+struct ShotSaveOutcome {
+    path: String,
+    copied: bool,
+    shot: Shot,
+    result: std::result::Result<(), String>,
+}
+
+/// Global screenshot hotkeys (work from anywhere while Crabby runs):
+/// Win+PrtSc fullscreen (like Windows), PrtSc region, Alt+PrtSc window.
+/// The manager must stay alive — dropping it unregisters the keys.
+struct HotkeyState {
+    _manager: Option<global_hotkey::GlobalHotKeyManager>,
+    /// (hotkey id, action) for every successfully registered key.
+    bindings: Vec<(u32, ShotMode)>,
+    /// Human-readable status for the screenshot section.
+    status: String,
+}
+
+impl HotkeyState {
+    fn init(enabled: bool) -> Self {
+        if !enabled {
+            return Self {
+                _manager: None,
+                bindings: Vec::new(),
+                status: "global keys off (shot_hotkeys = false)".to_owned(),
+            };
+        }
+        let manager = match global_hotkey::GlobalHotKeyManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                return Self {
+                    _manager: None,
+                    bindings: Vec::new(),
+                    status: format!("global keys unavailable: {e:?}"),
+                }
+            }
+        };
+        use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+        // (label, modifiers, key, action)
+        let wants = [
+            ("Win+PrtSc fullscreen", Some(Modifiers::SUPER), Code::PrintScreen, ShotMode::Fullscreen),
+            ("PrtSc region", None, Code::PrintScreen, ShotMode::Region),
+            ("Alt+PrtSc window", Some(Modifiers::ALT), Code::PrintScreen, ShotMode::Window),
+        ];
+        let mut bindings = Vec::new();
+        let mut failed = Vec::new();
+        for (label, mods, code, mode) in wants {
+            let hk = HotKey::new(mods, code);
+            match manager.register(hk) {
+                Ok(()) => bindings.push((hk.id(), mode)),
+                Err(_) => failed.push(label),
+            }
+        }
+        let live = wants
+            .iter()
+            .filter(|(label, _, _, _)| !failed.contains(label))
+            .map(|(label, _, _, _)| *label)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let status = if failed.is_empty() {
+            format!("keys live: {live}")
+        } else if bindings.is_empty() {
+            format!("global keys taken by another app ({})", failed.join(", "))
+        } else {
+            format!("keys live: {live}  (taken: {})", failed.join(", "))
+        };
+        Self { _manager: Some(manager), bindings, status }
+    }
+}
+
+const PEN_COLORS: [([u8; 4], &str); 6] = [
+    ([255, 60, 60, 255], "Red"),
+    ([255, 210, 60, 255], "Yellow"),
+    ([80, 220, 100, 255], "Green"),
+    ([90, 160, 255, 255], "Blue"),
+    ([255, 255, 255, 255], "White"),
+    ([20, 20, 20, 255], "Black"),
+];
+
+fn shot_texture(ctx: &egui::Context, name: &str, shot: &Shot) -> Option<egui::TextureHandle> {
+    if shot.is_empty() || (shot.width as usize) * (shot.height as usize) * 4 != shot.rgba.len() {
+        return None;
+    }
+    Some(ctx.load_texture(
+        name,
+        egui::ColorImage::from_rgba_unmultiplied(
+            [shot.width as usize, shot.height as usize],
+            &shot.rgba,
+        ),
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 struct LibFile {
@@ -247,6 +362,21 @@ pub struct GuiApp {
     /// Why the current recording uses its encoder (set at Start).
     enc_note: Option<String>,
     update: UpdateUi,
+
+    // --- screenshots (Snipping-Tool style) ---
+    shot_format: ShotFormat,
+    shot_dir: String,
+    shot_edit: Option<ShotEdit>,
+    shot_cap_rx: Option<Receiver<std::result::Result<Shot, String>>>,
+    shot_save_rx: Option<Receiver<ShotSaveOutcome>>,
+    shot_busy: bool,
+    hotkeys: HotkeyState,
+    /// Settings key the perf warning was last acknowledged for — pressing
+    /// Record again with unchanged settings records anyway; changing any
+    /// perf-relevant setting re-arms the guard.
+    perf_ack_key: String,
+    /// Show the one-click "safe 720p30" button under the transport.
+    perf_offer_safe: bool,
 }
 
 impl GuiApp {
@@ -327,6 +457,15 @@ impl GuiApp {
             error_msg: None,
             enc_note: None,
             update: UpdateUi::new(),
+            shot_format: file_cfg.shot_format.unwrap_or_default(),
+            shot_dir: file_cfg.shot_dir.unwrap_or_else(shot::screenshot_dir),
+            shot_edit: None,
+            shot_cap_rx: None,
+            shot_save_rx: None,
+            shot_busy: false,
+            hotkeys: HotkeyState::init(file_cfg.shot_hotkeys.unwrap_or(true)),
+            perf_ack_key: String::new(),
+            perf_offer_safe: false,
         };
         if let Some(from) = updated_from {
             app.done_msg = Some(format!(
@@ -505,6 +644,32 @@ impl GuiApp {
             self.error_msg = Some(format!("source unavailable: {e:?}"));
             return;
         }
+        // Perf pre-flight: a doomed recording (e.g. software x264 at
+        // 1440p60 on 4 threads) warns first instead of silently dropping
+        // 97% of frames. Pressing Record again with unchanged settings
+        // records anyway; changing settings re-arms the guard.
+        {
+            let fps = if self.fps60 { 60 } else { 30 };
+            let threads_eff = if self.threads == 0 {
+                capabilities().cpu_threads.max(1)
+            } else {
+                self.threads
+            };
+            let enc_id = check_tier(codec, self.tier).map(|(id, _)| id).unwrap_or("libx264");
+            let cpu_used = self.tier.vpx_cpu_used();
+            let verdict = check_perf(enc_id, self.tier, cpu_used, width, height, fps, threads_eff);
+            let key = format!("{enc_id}|{}|{width}x{height}@{}", self.tier.cli_name(), fps);
+            if verdict.level != PerfLevel::Ok && self.perf_ack_key != key {
+                self.perf_ack_key = key.clone();
+                self.perf_offer_safe = verdict.level == PerfLevel::TooHeavy;
+                self.error_msg = Some(format!(
+                    "likely to drop frames: {}. Fix the settings — or press Record again to record anyway.",
+                    verdict.message
+                ));
+                return;
+            }
+            self.perf_offer_safe = false;
+        }
         match start_session(cfg, true) {
             Ok(sess) => {
                 self.start_t = Instant::now();
@@ -535,8 +700,9 @@ impl GuiApp {
         let output = sess.output().to_owned();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            let tail = sess.ffmpeg_tail(3);
             let result = sess.wait().map_err(|e| format!("{e:?}"));
-            let _ = tx.send(StopOutcome { output, result });
+            let _ = tx.send(StopOutcome { output, result, ffmpeg_tail: tail });
         });
         self.pending = Some(rx);
         self.phase = Phase::Stopping;
@@ -568,10 +734,16 @@ impl GuiApp {
                     self.phase = Phase::Idle;
                     match done.result {
                         Ok(s) => {
-                            self.done_msg = Some(format!(
+                            let mut msg = format!(
                                 "Saved {}  ({} frames, {} dropped)",
                                 done.output, s.written, s.dropped
-                            ));
+                            );
+                            if s.dropped > 0 && s.dropped * 20 > s.captured.max(1) {
+                                if let Some(last) = done.ffmpeg_tail.last() {
+                                    msg.push_str(&format!("  ffmpeg: {last}"));
+                                }
+                            }
+                            self.done_msg = Some(msg);
                         }
                         Err(e) => {
                             if std::fs::metadata(&done.output)
@@ -613,12 +785,215 @@ impl GuiApp {
         self.preview_tex =
             Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR));
     }
+
+    // ---------- screenshots ----------
+
+    /// Start a capture on a background thread (WGC setup + fullscreen
+    /// overlay both block — never on the UI thread). Result lands in
+    /// `shot_cap_rx`, polled in `poll_shots`.
+    fn start_shot_capture(&mut self, mode: ShotMode) {
+        if self.shot_busy {
+            return;
+        }
+        self.error_msg = None;
+        let monitor = self.monitors.get(self.monitor_sel).map(|m| m.index);
+        let needle = if mode == ShotMode::Window {
+            match self.win_sel.and_then(|i| self.windows.get(i)) {
+                Some(w) => w.title.clone(),
+                None => {
+                    self.error_msg =
+                        Some("Pick a window in §1 first (or use Fullscreen).".to_owned());
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
+        let (tx, rx) = mpsc::channel();
+        self.shot_cap_rx = Some(rx);
+        self.shot_busy = true;
+        std::thread::spawn(move || {
+            let res: anyhow::Result<Shot> = (|| {
+                match mode {
+                    ShotMode::Fullscreen => shot::capture_monitor(monitor),
+                    ShotMode::Window => shot::capture_window(&needle),
+                    ShotMode::Region => {
+                        // Overlay first (blocks till drag/Esc), then one
+                        // fullscreen grab + in-memory crop — no temp files.
+                        let Some((x, y, w, h)) = shot::select_region()? else {
+                            anyhow::bail!("snip cancelled");
+                        };
+                        let full = shot::capture_monitor(monitor)?;
+                        shot::crop(&full, x, y, w, h)
+                    }
+                }
+            })();
+            let _ = tx.send(res.map_err(|e| format!("{e:?}")));
+        });
+    }
+
+    /// Save + clipboard on a background thread (PNG/WebP encode of a 1080p
+    /// frame is ~100 ms — never on the UI thread). Result lands in
+    /// `shot_save_rx` and becomes a toast.
+    fn save_shot_async(&mut self, img: Shot) {
+        let (tx, rx) = mpsc::channel();
+        self.shot_save_rx = Some(rx);
+        let dir = self.shot_dir.clone();
+        let format = self.shot_format;
+        std::thread::spawn(move || {
+            let saved = shot::save_shot(&img, &dir, None, format);
+            let (result, copied) = match saved {
+                Ok(path) => {
+                    let copied = shot::copy_to_clipboard(&img).is_ok();
+                    (Ok(path.clone()), copied)
+                }
+                Err(e) => (Err(format!("{e:?}")), false),
+            };
+            let _ = tx.send(ShotSaveOutcome {
+                path: result.clone().unwrap_or_default(),
+                copied,
+                shot: img,
+                result: result.map(|_| ()),
+            });
+        });
+    }
+
+    /// Drain screenshot channels: open the editor + autosave on capture,
+    /// raise a toast on save. Textures upload here (needs `ctx`).
+    fn poll_shots(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.shot_cap_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.shot_cap_rx = None;
+                self.shot_busy = false;
+                match res {
+                    Ok(img) => {
+                        let tex = shot_texture(ctx, "shot-edit", &img);
+                        self.shot_edit = Some(ShotEdit {
+                            shot: img.clone(),
+                            tex,
+                            pen: 0,
+                            pen_size: 6.0,
+                            crop_mode: false,
+                            crop_rect: None,
+                            drag_start: None,
+                            cur_stroke: Vec::new(),
+                        });
+                        // Autosave + clipboard now; the editor re-saves on
+                        // demand after pen/crop edits.
+                        self.save_shot_async(img);
+                    }
+                    Err(e) => {
+                        if e != "snip cancelled" {
+                            self.error_msg = Some(format!("screenshot: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.shot_save_rx {
+            if let Ok(done) = rx.try_recv() {
+                self.shot_save_rx = None;
+                match done.result {
+                    Ok(()) => {
+                        // Desktop popup (bottom-right of the screen, 3 s,
+                        // hover to keep) + a quiet line in the app.
+                        shot::show_popup(done.shot, done.path.clone());
+                        self.done_msg = Some(format!(
+                            "Screenshot saved {}  ({})",
+                            done.path,
+                            if done.copied { "copied to clipboard" } else { "clipboard copy failed" }
+                        ));
+                    }
+                    Err(e) => self.error_msg = Some(format!("screenshot save: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Global hotkeys (Win+PrtSc etc. — work even when Crabby isn't
+    /// focused) plus in-app Snipping-Tool shortcuts (Alt+N/W/F new snip,
+    /// Ctrl+S save, Ctrl+C copy, Esc close editor).
+    fn poll_hotkeys(&mut self, ctx: &egui::Context) {
+        // Global keys first: collect actions, then fire (busy guard dedups).
+        let mut modes: Vec<ShotMode> = Vec::new();
+        while let Ok(ev) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
+            if let Some((_, m)) = self.hotkeys.bindings.iter().find(|(id, _)| *id == ev.id) {
+                modes.push(*m);
+            }
+        }
+        for m in modes {
+            self.start_shot_capture(m);
+        }
+
+        // In-app shortcuts — never while typing in a text field.
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let mut save_edit = false;
+        let mut copy_edit = false;
+        ctx.input_mut(|i| {
+            if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::ALT,
+                egui::Key::N,
+            )) {
+                self.start_shot_capture(ShotMode::Region);
+            }
+            if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::ALT,
+                egui::Key::W,
+            )) {
+                self.start_shot_capture(ShotMode::Window);
+            }
+            if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::ALT,
+                egui::Key::F,
+            )) {
+                self.start_shot_capture(ShotMode::Fullscreen);
+            }
+            if self.shot_edit.is_some() {
+                if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL,
+                    egui::Key::S,
+                )) {
+                    save_edit = true;
+                }
+                if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL,
+                    egui::Key::C,
+                )) {
+                    copy_edit = true;
+                }
+            }
+        });
+        if save_edit {
+            if let Some(ed) = &self.shot_edit {
+                self.save_shot_async(ed.shot.clone());
+            }
+        }
+        if copy_edit {
+            if let Some(ed) = &self.shot_edit {
+                match shot::copy_to_clipboard(&ed.shot) {
+                    Ok(()) => {
+                        self.done_msg = Some("Screenshot copied to clipboard.".to_owned())
+                    }
+                    Err(e) => self.error_msg = Some(format!("copy failed: {e:?}")),
+                }
+            }
+        }
+        // Esc closes the editor (the region overlay handles its own Esc).
+        if self.shot_edit.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.shot_edit = None;
+        }
+    }
+
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
         self.update.poll();
+        self.poll_shots(ctx);
+        self.poll_hotkeys(ctx);
         // Throttled repaints: ~10 Hz while recording (preview + stats),
         // slower while finalizing, fully static when idle (0% UI cost).
         if self.phase == Phase::Recording {
@@ -1172,6 +1547,15 @@ impl eframe::App for GuiApp {
                                     egui::Color32::YELLOW,
                                     "Dropping frames — step down a tier or try 30 fps.",
                                 );
+                                // ffmpeg's own complaint (queue overflow,
+                                // timestamp gaps, …) when it has one.
+                                if let Some(sess) = self.session.as_ref() {
+                                    if let Some(line) =
+                                        sess.ffmpeg_tail(1).into_iter().next()
+                                    {
+                                        ui.weak(format!("ffmpeg: {line}"));
+                                    }
+                                }
                             }
                             if let Some(n) = &self.enc_note {
                                 ui.weak(n);
@@ -1180,6 +1564,27 @@ impl eframe::App for GuiApp {
                         Phase::Stopping => {
                             ui.spinner();
                             ui.label("Finalizing video…");
+                        }
+                    }
+                    // One-click escape hatch after a perf warning: settings
+                    // a software encoder can actually hold on this machine.
+                    if self.perf_offer_safe && self.phase == Phase::Idle {
+                        ui.add_space(4.0);
+                        if ui
+                            .button("Use safe 720p30 Fastest")
+                            .on_hover_text("720p + 30 fps + Fastest tier + Auto H.264, then press Record")
+                            .clicked()
+                        {
+                            self.tier = Tier::Fastest;
+                            self.fps60 = false;
+                            self.res_sel = 2; // 720p fixed
+                            self.enc_sel = 0; // Auto (H.264 best available)
+                            self.bitrate_sel = 0; // Auto (tier)
+                            self.perf_offer_safe = false;
+                            self.error_msg = None;
+                            self.done_msg = Some(
+                                "Safe settings applied (720p30 Fastest) — press Record.".to_owned(),
+                            );
                         }
                     }
                 });
@@ -1239,11 +1644,13 @@ impl eframe::App for GuiApp {
                             }
                         });
                         if let Some(p) = play_path {
-                            if std::process::Command::new("cmd")
-                                .args(["/C", "start", "", &p])
-                                .spawn()
-                                .is_err()
+                            let mut cmd = std::process::Command::new("cmd");
+                            cmd.args(["/C", "start", "", &p]);
+                            #[cfg(target_os = "windows")]
                             {
+                                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                            }
+                            if cmd.spawn().is_err() {
                                 self.error_msg = Some(format!("couldn't play {p}"));
                             }
                         }
@@ -1252,6 +1659,284 @@ impl eframe::App for GuiApp {
                                 let _ = std::fs::remove_file(&f.path);
                             }
                             self.refresh_library();
+                        }
+                    }
+                });
+
+                ui.group(|ui| {
+                    ui.strong("5 · Screenshot (Snipping-Tool style)");
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(!self.shot_busy && !recording, |ui| {
+                            if ui
+                                .button("▢ Region")
+                                .on_hover_text("Drag a rectangle (Esc cancels)")
+                                .clicked()
+                            {
+                                self.start_shot_capture(ShotMode::Region);
+                            }
+                            if ui
+                                .button("▣ Window")
+                                .on_hover_text("Capture the window picked in §1")
+                                .clicked()
+                            {
+                                self.start_shot_capture(ShotMode::Window);
+                            }
+                            if ui
+                                .button("⛶ Fullscreen")
+                                .on_hover_text("Capture the monitor picked in §1")
+                                .clicked()
+                            {
+                                self.start_shot_capture(ShotMode::Fullscreen);
+                            }
+                        });
+                        if self.shot_busy {
+                            ui.spinner();
+                            ui.weak("snipping…");
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        egui::ComboBox::from_id_salt("shotfmt")
+                            .selected_text(self.shot_format.label())
+                            .show_ui(ui, |ui| {
+                                for f in [
+                                    ShotFormat::Png,
+                                    ShotFormat::Webp,
+                                    ShotFormat::Jpg,
+                                    ShotFormat::Bmp,
+                                ] {
+                                    ui.selectable_value(&mut self.shot_format, f, f.label());
+                                }
+                            });
+                        ui.label("Folder:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.shot_dir)
+                                .desired_width(220.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .set_directory(&self.shot_dir)
+                                .pick_folder()
+                            {
+                                self.shot_dir = p.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.weak("Auto-saves + copies to clipboard. Region snips the primary monitor; Window/Fullscreen follow §1. JPG = fastest, WebP = small + sharp.");
+                    ui.weak(&self.hotkeys.status);
+                    ui.weak("In-app: Alt+N region · Alt+W window · Alt+F fullscreen · Ctrl+S save · Ctrl+C copy · Esc close.");
+
+                    if self.shot_edit.is_some() {
+                        ui.separator();
+                        let mut do_save = false;
+                        let mut do_copy = false;
+                        let mut do_close = false;
+                        let mut apply_crop = false;
+                        ui.horizontal(|ui| {
+                            ui.strong("Edit");
+                            let ed = self.shot_edit.as_mut().expect("checked above");
+                            egui::ComboBox::from_id_salt("shotpen")
+                                .selected_text(PEN_COLORS[ed.pen].1)
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, n)) in PEN_COLORS.iter().enumerate() {
+                                        ui.selectable_value(&mut ed.pen, i, *n);
+                                    }
+                                });
+                            ui.add(
+                                egui::Slider::new(&mut ed.pen_size, 2.0..=24.0).suffix("px"),
+                            );
+                            ui.checkbox(&mut ed.crop_mode, "Crop");
+                            if ed.crop_mode && ui.button("Apply crop").clicked() {
+                                apply_crop = true;
+                            }
+                            if ui.button("Save").clicked() {
+                                do_save = true;
+                            }
+                            if ui.button("Copy").clicked() {
+                                do_copy = true;
+                            }
+                            if ui.button("Close").clicked() {
+                                do_close = true;
+                            }
+                        });
+                        if apply_crop {
+                            let mut err = None;
+                            if let Some(ed) = self.shot_edit.as_mut() {
+                                match ed.crop_rect {
+                                    Some(r) => {
+                                        let x = r.min.x.round().max(0.0) as u32;
+                                        let y = r.min.y.round().max(0.0) as u32;
+                                        let w = r.width().round() as u32;
+                                        let h = r.height().round() as u32;
+                                        match shot::crop(&ed.shot, x, y, w, h) {
+                                            Ok(c) => {
+                                                ed.shot = c;
+                                                ed.tex =
+                                                    shot_texture(ctx, "shot-edit", &ed.shot);
+                                                ed.crop_rect = None;
+                                            }
+                                            Err(e) => err = Some(format!("{e:?}")),
+                                        }
+                                    }
+                                    None => {
+                                        err = Some(
+                                            "drag on the image to pick a crop first".to_owned(),
+                                        )
+                                    }
+                                }
+                            }
+                            if let Some(e) = err {
+                                self.error_msg = Some(e);
+                            }
+                        }
+                        if do_save {
+                            if let Some(ed) = &self.shot_edit {
+                                self.save_shot_async(ed.shot.clone());
+                            }
+                        }
+                        if do_copy {
+                            if let Some(ed) = &self.shot_edit {
+                                match shot::copy_to_clipboard(&ed.shot) {
+                                    Ok(()) => {
+                                        self.done_msg = Some(
+                                            "Screenshot copied to clipboard.".to_owned(),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        self.error_msg =
+                                            Some(format!("copy failed: {e:?}"))
+                                    }
+                                }
+                            }
+                        }
+                        if do_close {
+                            self.shot_edit = None;
+                        }
+                        // Canvas: drag to draw (pen) or to mark the crop rect.
+                        // Strokes commit to pixels on release — one texture
+                        // upload per stroke keeps 4K edits smooth.
+                        if let Some(ed) = self.shot_edit.as_mut() {
+                            let (w, h) = (ed.shot.width as f32, ed.shot.height as f32);
+                            let avail = ui.available_width();
+                            let scale = (avail / w).min(420.0 / h).clamp(0.05, 1.0);
+                            let size = egui::vec2(w * scale, h * scale);
+                            let tex_id = ed.tex.as_ref().map(|t| t.id());
+                            let (rect, resp) =
+                                ui.allocate_exact_size(size, egui::Sense::drag());
+                            if let Some(tid) = tex_id {
+                                ui.painter().image(
+                                    tid,
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            let to_img = |p: egui::Pos2| {
+                                egui::pos2(
+                                    (p.x - rect.min.x) / scale,
+                                    (p.y - rect.min.y) / scale,
+                                )
+                            };
+                            let to_screen = |p: egui::Pos2| {
+                                egui::pos2(
+                                    rect.min.x + p.x * scale,
+                                    rect.min.y + p.y * scale,
+                                )
+                            };
+                            if resp.drag_started() {
+                                if let Some(p) = resp.interact_pointer_pos() {
+                                    let q = to_img(p);
+                                    ed.drag_start = Some(q);
+                                    if !ed.crop_mode {
+                                        ed.cur_stroke = vec![q];
+                                    }
+                                }
+                            }
+                            if resp.dragged() {
+                                if let (Some(s), Some(p)) =
+                                    (ed.drag_start, resp.interact_pointer_pos())
+                                {
+                                    let cur = to_img(p);
+                                    if ed.crop_mode {
+                                        ed.crop_rect =
+                                            Some(egui::Rect::from_two_pos(s, cur));
+                                    } else {
+                                        ed.cur_stroke.push(cur);
+                                    }
+                                }
+                            }
+                            if resp.drag_stopped() {
+                                if !ed.crop_mode {
+                                    let (color, _) = PEN_COLORS[ed.pen];
+                                    let px = ed.pen_size;
+                                    let pts = std::mem::take(&mut ed.cur_stroke);
+                                    if pts.len() == 1 {
+                                        let p = pts[0];
+                                        shot::stroke_line(
+                                            &mut ed.shot, p.x, p.y, p.x, p.y, color, px,
+                                        );
+                                    } else {
+                                        for pair in pts.windows(2) {
+                                            shot::stroke_line(
+                                                &mut ed.shot,
+                                                pair[0].x,
+                                                pair[0].y,
+                                                pair[1].x,
+                                                pair[1].y,
+                                                color,
+                                                px,
+                                            );
+                                        }
+                                    }
+                                    ed.tex = shot_texture(ctx, "shot-edit", &ed.shot);
+                                }
+                                ed.drag_start = None;
+                            }
+                            if ed.crop_mode {
+                                if let Some(r) = ed.crop_rect {
+                                    let rs = egui::Rect::from_two_pos(
+                                        to_screen(r.min),
+                                        to_screen(r.max),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rs,
+                                        0.0,
+                                        egui::Color32::from_white_alpha(20),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        rs,
+                                        0.0,
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            egui::Color32::from_rgb(88, 101, 242),
+                                        ),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                                ui.weak("Drag on the image to pick the crop, then Apply crop.");
+                            } else {
+                                if ed.cur_stroke.len() >= 2 {
+                                    let (color, _) = PEN_COLORS[ed.pen];
+                                    let pts: Vec<egui::Pos2> = ed
+                                        .cur_stroke
+                                        .iter()
+                                        .map(|p| to_screen(*p))
+                                        .collect();
+                                    ui.painter().add(egui::Shape::line(
+                                        pts,
+                                        egui::Stroke::new(
+                                            ed.pen_size * scale,
+                                            egui::Color32::from_rgba_unmultiplied(
+                                                color[0], color[1], color[2], color[3],
+                                            ),
+                                        ),
+                                    ));
+                                }
+                                ui.weak("Drag on the image to draw. Save re-saves the edited shot.");
+                            }
                         }
                     }
                 });

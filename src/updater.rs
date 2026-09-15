@@ -21,6 +21,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as _;
+
 /// GitHub repo that hosts the releases.
 pub const OWNER: &str = "Shockwav-e";
 pub const REPO: &str = "screen-recorder";
@@ -205,7 +208,7 @@ pub fn install_and_restart(staged: &Path) -> Result<()> {
         :wait\r\n\
         tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n\
         move /y \"{staged}\" \"{exe}\" >nul\r\n\
-        start \"\" \"{exe}\" --updated-from {from}\r\n\
+        start /B \"\" \"{exe}\" --updated-from {from}\r\n\
         (goto) 2>nul & del \"%~f0\"\r\n",
         pid = pid,
         staged = staged.display(),
@@ -215,6 +218,7 @@ pub fn install_and_restart(staged: &Path) -> Result<()> {
     std::fs::write(&bat, script).context("couldn't write updater script")?;
     std::process::Command::new("cmd")
         .args(["/C", "start", "/min", "", &bat.to_string_lossy()])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .spawn()
         .context("couldn't launch updater")?;
     std::process::exit(0);
